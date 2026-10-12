@@ -1,10 +1,16 @@
 # Easy VPN
 
-**版本：1.0.11**
+**版本：1.0.13**
 
 Easy VPN 是独立的 VPS 协议搭建与节点管理项目。启动后直接进入协议菜单，不包含 SSH 管理、系统安全、网络优化或 IP 测试等通用运维模块。
 
-## 1.0.11 全局安全与稳定性复核
+## 1.0.13 国内加速安装
+
+- 新增国内网络推荐的一键安装入口，使用 GH-Proxy 加速获取 Easy VPN 源码。
+- 安装器会将加速源模式保存到 `/etc/easy-vpn/github-source-mode`，后续程序/协议清单检查也优先使用加速源；单个项目文件请求失败时会尝试官方 GitHub Raw 源。
+- 仓库固定为 `yesok6/easy-vpn`，普通用户无需填写用户名、仓库名或配置其他仓库地址。
+
+## 1.0.12 安装入口稳定性修复
 
 - `install.sh` 和 `vpn` 快捷命令现在会分发 `--pipeline-reality`，并在非交互模式下调用 VLESS + Reality 自动部署；无法自动取得公网 IP 时可通过 `EASY_VPN_SERVER_IP` 显式提供地址。
 - 安装快捷命令前自动创建目标父目录，兼容 `/usr/local/bin` 等目录不存在的精简系统。
@@ -71,25 +77,21 @@ sudo bash install.sh
 
 安装器会将运行文件安装到 `/opt/easy-vpn`，运行日志和配置状态放在 `/etc/easy-vpn`，并创建快捷命令 `vpn`（默认位于 `/usr/local/bin/vpn`）。交互式终端会直接显示协议菜单；通过管道安装时，安装器会尝试重新连接当前终端。如果没有可交互终端，则完成安装并提示之后运行 `vpn`，不会因 stdin EOF 假装进入菜单后闪退。
 
-### 一键安装
+### 一键安装（国内网络加速）
 
-默认仓库地址配置为 `yesok6/easy-vpn`，默认分支为 `main`。将项目上传到该 GitHub 仓库并选择 `main` 作为默认分支后，可使用：
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
-```
-
-国内拥堵加速镜像
+国内网络推荐使用以下命令。安装脚本和后续 Easy VPN 项目文件同步会优先通过 GH-Proxy 获取；下载单个项目文件失败时，安装器会尝试回退到 GitHub 官方 Raw 源。加速源选择会保存到 `/etc/easy-vpn/github-source-mode`，之后菜单中的程序版本和协议清单检查也会沿用这一设置。
 
 ```bash
-curl -fsSL "https://ghproxy.net/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
+curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china bash
 ```
+
+仓库和分支已固定为本项目的 `yesok6/easy-vpn` 与 `main`，不需要填写用户名或仓库名。GH-Proxy 是第三方公共加速服务；如果初始安装脚本本身无法从加速服务下载，可将链接里的 `https://gh-proxy.org/` 前缀去掉，改用 GitHub 官方 Raw 地址重新获取安装脚本。
 
 菜单第 6 项会分别检查 Easy VPN 程序版本、已实现协议适配版本，以及 sing-box 内核的最新稳定版本。发现程序更新时，选择 `1` 并输入 `Y` 才会更新；程序和协议适配已是最新版本时，可选择 `2` 并输入 `Y` 重装当前远端最新版，输入 `N` 则取消。sing-box 内核目前只检查并提示，不会随程序更新自动替换。
 
 更新与重装都会先下载全部项目文件到临时目录，检查 HTTPS 下载结果、版本一致性、协议清单 JSON、Bash 语法和磁盘空间；随后备份旧程序文件，再逐个原子替换，最后进行模块加载健康检查。若切换或健康检查失败，会尝试恢复已替换的旧文件。配置、节点信息、证书、私钥和正在运行的 sing-box 服务不会被更新流程主动修改。更新前的程序文件备份保存在 `/etc/easy-vpn/backups/`。若自动回滚也失败，会明确提示保留的备份路径。此流程降低更新风险，但不能替代 VPS 快照/异地备份。
 
-更新源由 `EASY_VPN_BRANCH` 指定，默认使用 `main`。检查 sing-box 版本时优先使用 GitHub Release API；API 限流或不可用时，会回退读取 GitHub `releases/latest` 重定向并确认对应架构的资产存在。获取 SHA-256 时也会尝试 Release 页面公开的资产 digest；任何路径都不会在默认设置下跳过内核文件校验。
+Easy VPN 项目更新默认使用固定的 `main` 分支，并沿用已保存的国内加速源设置。检查 sing-box 版本时优先使用 GitHub Release API；API 限流或不可用时，会回退读取 GitHub `releases/latest` 重定向并确认对应架构的资产存在。获取 SHA-256 时也会尝试 Release 页面公开的资产 digest；任何路径都不会在默认设置下跳过内核文件校验。
 
 ## 如何发布新协议与更新
 
