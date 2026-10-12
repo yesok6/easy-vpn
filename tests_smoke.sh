@@ -12,6 +12,22 @@ jq empty "$ROOT/protocol_catalog.json" || fail "protocol catalog JSON"
 [[ "$(cat "$ROOT/VERSION")" == "$(jq -r '.tool_version' "$ROOT/protocol_catalog.json")" ]] || fail "VERSION/catalog version mismatch"
 grep -Fq "**版本：$(cat "$ROOT/VERSION")**" "$ROOT/README.md" || fail "README version mismatch"
 
+# Regression: curl | bash runs with no BASH_SOURCE[0]; strict nounset must not abort.
+stdin_source_result=$(printf '%s\n' \
+  'set -Eeuo pipefail' \
+  'script_source="${BASH_SOURCE[0]-}"' \
+  'err_source="${BASH_SOURCE[1]-}"' \
+  '[[ -n "$err_source" ]] || err_source="${BASH_SOURCE[0]-main}"' \
+  '[[ -z "$script_source" && "$err_source" == main ]]' | bash) || fail "stdin bootstrap BASH_SOURCE fallback failed"
+grep -Fq 'SCRIPT_SOURCE="${BASH_SOURCE[0]-}"' "$ROOT/install.sh" || fail "installer still indexes BASH_SOURCE unsafely"
+grep -Fq '[[ -z "$current_script_path" || "$current_script_path" != "$local_install_path" ]]' "$ROOT/install.sh" || fail "stdin bootstrap does not force durable local install"
+stdin_trap_output=$(printf '%s\n' \
+  'set -Eeuo pipefail' \
+  'on_error() { local rc=$?; local err_source="${BASH_SOURCE[1]-}"; [[ -n "$err_source" ]] || err_source="${BASH_SOURCE[0]-main}"; local err_line="${BASH_LINENO[0]-0}"; printf "trap=%s:%s\n" "$err_source" "$err_line"; return "$rc"; }' \
+  'trap on_error ERR' \
+  'false' | bash 2>&1 || true)
+grep -Fq 'trap=main:' <<< "$stdin_trap_output" || fail "ERR trap still fails when BASH_SOURCE is unset"
+
 for module in security apps optimize ip_test; do
     [[ ! -e "$ROOT/modules/${module}.sh" ]] || fail "unrelated module included: ${module}.sh"
 done
@@ -602,9 +618,9 @@ esac
 MOCK_CURL
 chmod 755 "$update_test/mockbin/curl" "$update_test/mockbin/sing-box"
 cp "$update_test/same/protocol_catalog.json" "$update_test/new/protocol_catalog.json"
-jq --arg version '1.0.12' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
+jq --arg version '1.0.13' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
 mv "$update_test/new/catalog.tmp" "$update_test/new/protocol_catalog.json"
-printf '1.0.12\n' > "$update_test/new/VERSION"
+printf '1.0.13\n' > "$update_test/new/VERSION"
 no_update_output=$(printf '0\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/same" \
     EASY_VPN_ROOT="$ROOT" EASY_VPN_ETC="$update_test/etc" EASY_VPN_STATE="$update_test/state" \
     EASY_VPN_BACKUPS="$update_test/backups" EASY_VPN_LOG="$update_test/log" \
@@ -690,6 +706,53 @@ if [[ $EUID -eq 0 ]]; then
         [[ "$after_hash" == "${before_hashes[$i]}" ]] || fail "rollback did not restore ${live_files[$i]}"
     done
     grep -q '回滚完成' "$isolated/rollback.log" || { cat "$isolated/rollback.log" >&2; fail "rollback confirmation missing"; }
+
+    # End-to-end bootstrap regression: emulate `curl ... | sudo bash`, where
+    # BASH_SOURCE[0] is unset. Mock only the raw-file downloads; install into /tmp.
+    pipe_isolated=$(mktemp -d /tmp/easy-vpn-piped-bootstrap.XXXXXX)
+    mkdir -p "$pipe_isolated/mockbin"
+    cat > "$pipe_isolated/mockbin/curl" <<'MOCK_RAW_CURL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+out=""; url=""
+while (($#)); do
+    case "$1" in
+        -o|--output) out="${2:-}"; shift 2 ;;
+        http://*|https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+[[ -n "$out" && "$url" == https://raw.githubusercontent.com/yesok6/easy-vpn/main/* ]] || {
+    echo "unexpected mocked curl request" >&2; exit 1;
+}
+rel="${url#https://raw.githubusercontent.com/yesok6/easy-vpn/main/}"
+rel="${rel%%\?*}"
+case "$rel" in install.sh|VERSION|lib/common.sh|modules/protocol.sh|protocol_catalog.json) ;;
+    *) echo "unexpected mocked path: $rel" >&2; exit 1 ;;
+esac
+cp -- "$MOCK_SOURCE_DIR/$rel" "$out"
+MOCK_RAW_CURL
+    chmod 755 "$pipe_isolated/mockbin/curl"
+    if ! cat "$ROOT/install.sh" | PATH="$pipe_isolated/mockbin:$PATH" MOCK_SOURCE_DIR="$ROOT" TERM=xterm \
+        EASY_VPN_TTY_DEVICE="$pipe_isolated/no-tty" \
+        EASY_VPN_ROOT="$pipe_isolated/root" EASY_VPN_ETC="$pipe_isolated/etc" \
+        EASY_VPN_SHORTCUT="$pipe_isolated/bin/vpn" EASY_VPN_LEGACY_SHORTCUT="$pipe_isolated/bin/easy-vpn" \
+        bash >"$pipe_isolated/install.log" 2>&1; then
+        cat "$pipe_isolated/install.log" >&2
+        fail "piped stdin bootstrap installer failed"
+    fi
+    [[ -x "$pipe_isolated/root/install.sh" && -f "$pipe_isolated/root/modules/protocol.sh" ]] || {
+        cat "$pipe_isolated/install.log" >&2
+        fail "piped stdin bootstrap did not sync durable install files"
+    }
+    grep -q '没有可交互终端' "$pipe_isolated/install.log" || {
+        cat "$pipe_isolated/install.log" >&2
+        fail "piped stdin bootstrap did not finish gracefully without a TTY"
+    }
+    ! grep -q 'BASH_SOURCE\[0\]: unbound variable' "$pipe_isolated/install.log" || {
+        cat "$pipe_isolated/install.log" >&2
+        fail "piped stdin bootstrap still references unset BASH_SOURCE"
+    }
 fi
 
 # 11. SNI no longer auto-selects Google; custom Reality SNI values are validated.
