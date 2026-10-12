@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-CURRENT_VERSION="1.0.11"
+CURRENT_VERSION="1.0.12"
 GITHUB_USER="${EASY_VPN_GITHUB_USER:-yesok6}"
 GITHUB_REPO="${EASY_VPN_GITHUB_REPO:-easy-vpn}"
 export EASY_VPN_GITHUB_USER="$GITHUB_USER" EASY_VPN_GITHUB_REPO="$GITHUB_REPO"
@@ -15,7 +15,13 @@ LOG_DIR="${EASY_VPN_ETC:-/etc/easy-vpn}"
 LOG_FILE="${LOG_DIR}/install.log"
 SHORTCUT="${EASY_VPN_SHORTCUT:-/usr/local/bin/vpn}"
 LEGACY_SHORTCUT="${EASY_VPN_LEGACY_SHORTCUT:-${SHORTCUT%/*}/easy-vpn}"
-SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || SOURCE_DIR=""
+# BASH_SOURCE[0] is unset when this installer is fed to Bash over stdin
+# (for example: curl ... | sudo bash). Never index it unguarded under set -u.
+SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
+SOURCE_DIR=""
+if [[ -n "$SCRIPT_SOURCE" ]]; then
+    SOURCE_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" 2>/dev/null && pwd -P)" || SOURCE_DIR=""
+fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; PLAIN='\033[0m'
 
@@ -34,7 +40,10 @@ log_action() {
 
 on_error() {
     local rc=$?
-    echo -e "${RED}[错误]${PLAIN} 操作失败（退出码 ${rc}，位置 ${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}:${BASH_LINENO[0]:-0}）。"
+    local err_source="${BASH_SOURCE[1]-}"
+    [[ -n "$err_source" ]] || err_source="${BASH_SOURCE[0]-main}"
+    local err_line="${BASH_LINENO[0]-0}"
+    echo -e "${RED}[错误]${PLAIN} 操作失败（退出码 ${rc}，位置 ${err_source}:${err_line}）。"
     echo -e "${YELLOW}[提示]${PLAIN} 详细日志：${LOG_FILE}"
     log_action "[失败] exit=${rc}"
     return "$rc"
@@ -396,9 +405,14 @@ if [[ "${1:-}" == "--update-return" ]]; then
     exit $?
 fi
 
-current_script_path=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+current_script_path=""
+if [[ -n "$SCRIPT_SOURCE" ]]; then
+    current_script_path=$(readlink -f -- "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")
+fi
 local_install_path=$(readlink -m -- "${LOCAL_ROOT}/install.sh" 2>/dev/null || printf '%s' "${LOCAL_ROOT}/install.sh")
-if [[ "$current_script_path" != "$local_install_path" ]]; then
+# An empty source path means the bootstrap came from stdin; force remote sync
+# into the durable install tree before re-executing the installed installer.
+if [[ -z "$current_script_path" || "$current_script_path" != "$local_install_path" ]]; then
     sync_bundle "$SOURCE_DIR"
     exec "${LOCAL_ROOT}/install.sh" "$@"
 fi
