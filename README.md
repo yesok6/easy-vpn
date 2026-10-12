@@ -79,10 +79,10 @@ sudo bash install.sh
 curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
 ```
 
-如使用其他 GitHub 用户、仓库或分支，可在运行安装器前设置 `EASY_VPN_GITHUB_USER`、`EASY_VPN_GITHUB_REPO` 或 `EASY_VPN_BRANCH`。例如：
+国内拥堵加速镜像
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/你的用户名/你的仓库/main/install.sh" | sudo env EASY_VPN_GITHUB_USER=你的用户名 EASY_VPN_GITHUB_REPO=你的仓库 EASY_VPN_BRANCH=main bash
+curl -fsSL "https://ghproxy.net/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
 ```
 
 菜单第 6 项会分别检查 Easy VPN 程序版本、已实现协议适配版本，以及 sing-box 内核的最新稳定版本。发现程序更新时，选择 `1` 并输入 `Y` 才会更新；程序和协议适配已是最新版本时，可选择 `2` 并输入 `Y` 重装当前远端最新版，输入 `N` 则取消。sing-box 内核目前只检查并提示，不会随程序更新自动替换。
