@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "tool_version": "1.0.11",
+  "updated_at": "2026-10-11",
+  "protocols": [
+    {
+      "id": "vless-reality",
+      "name": "VLESS + Reality",
+      "status": "stable",
+      "implemented": true,
+      "adapter_version": 1,
+      "updated_at": null
+    },
+    {
+      "id": "hysteria2",
+      "name": "Hysteria 2",
+      "status": "stable",
+      "implemented": true,
+      "adapter_version": 1,
+      "updated_at": null
+    },
+    {
+      "id": "tuic-v5",
+      "name": "TUIC v5",
+      "status": "stable",
+      "implemented": true,
+      "adapter_version": 3,
+      "updated_at": null
+    }
+  ]
+}
