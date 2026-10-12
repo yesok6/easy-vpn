@@ -77,9 +77,15 @@ sudo bash install.sh
 
 安装器会将运行文件安装到 `/opt/easy-vpn`，运行日志和配置状态放在 `/etc/easy-vpn`，并创建快捷命令 `vpn`（默认位于 `/usr/local/bin/vpn`）。交互式终端会直接显示协议菜单；通过管道安装时，安装器会尝试重新连接当前终端。如果没有可交互终端，则完成安装并提示之后运行 `vpn`，不会因 stdin EOF 假装进入菜单后闪退。
 
+### 一键安装
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china bash
+```
+
 ### 一键安装（国内网络加速）
 
-国内网络推荐使用以下命令。安装脚本和后续 Easy VPN 项目文件同步会优先通过 GH-Proxy 获取；下载单个项目文件失败时，安装器会尝试回退到 GitHub 官方 Raw 源。加速源选择会保存到 `/etc/easy-vpn/github-source-mode`，之后菜单中的程序版本和协议清单检查也会沿用这一设置。
+vps在国内网络推荐使用以下命令。安装脚本和后续 Easy VPN 项目文件同步会优先通过 GH-Proxy 获取；下载单个项目文件失败时，安装器会尝试回退到 GitHub 官方 Raw 源。加速源选择会保存到 `/etc/easy-vpn/github-source-mode`，之后菜单中的程序版本和协议清单检查也会沿用这一设置。
 
 ```bash
 curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china bash
