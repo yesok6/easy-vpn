@@ -2,9 +2,10 @@
 set -Eeuo pipefail
 umask 077
 
-CURRENT_VERSION="1.0.12"
-GITHUB_USER="${EASY_VPN_GITHUB_USER:-yesok6}"
-GITHUB_REPO="${EASY_VPN_GITHUB_REPO:-easy-vpn}"
+CURRENT_VERSION="1.0.17"
+# This project has a fixed public repository; users do not need to configure owner/repo.
+GITHUB_USER="yesok6"
+GITHUB_REPO="easy-vpn"
 export EASY_VPN_GITHUB_USER="$GITHUB_USER" EASY_VPN_GITHUB_REPO="$GITHUB_REPO"
 EASY_VPN_BRANCH="${EASY_VPN_BRANCH:-main}"
 export EASY_VPN_BRANCH
@@ -13,7 +14,11 @@ LOCAL_MODULES="${LOCAL_ROOT}/modules"
 LOCAL_LIB="${LOCAL_ROOT}/lib"
 LOG_DIR="${EASY_VPN_ETC:-/etc/easy-vpn}"
 LOG_FILE="${LOG_DIR}/install.log"
+GITHUB_SOURCE_MODE_FILE="${LOG_DIR}/github-source-mode"
+PROXY_CONSENT_FILE="${LOG_DIR}/allow-unsigned-proxy"
 SHORTCUT="${EASY_VPN_SHORTCUT:-/usr/local/bin/vpn}"
+# Linux command names are case-sensitive; install both `vpn` and `VPN` for convenience.
+UPPERCASE_SHORTCUT="${EASY_VPN_UPPERCASE_SHORTCUT:-${SHORTCUT%/*}/VPN}"
 LEGACY_SHORTCUT="${EASY_VPN_LEGACY_SHORTCUT:-${SHORTCUT%/*}/easy-vpn}"
 # BASH_SOURCE[0] is unset when this installer is fed to Bash over stdin
 # (for example: curl ... | sudo bash). Never index it unguarded under set -u.
@@ -22,6 +27,14 @@ SOURCE_DIR=""
 if [[ -n "$SCRIPT_SOURCE" ]]; then
     SOURCE_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" 2>/dev/null && pwd -P)" || SOURCE_DIR=""
 fi
+
+# 可选发布签名公钥（ECDSA P-256，PEM），由维护者运行 tools/release.sh release 注入。
+# 当前公钥为空时，官方源仍通过 HTTPS 下载；第三方国内代理必须由用户明确选择并接受未签名风险。
+# 配置公钥后，所有远程项目文件都必须匹配 SHA256SUMS 的签名和逐文件哈希。
+# 不允许使用普通环境变量覆盖公钥，避免更新流程被意外降级为不校验。
+# >>> EASY_VPN_RELEASE_PUBKEY >>>
+EASY_VPN_RELEASE_PUBKEY=''
+# <<< EASY_VPN_RELEASE_PUBKEY <<<
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; PLAIN='\033[0m'
 
@@ -38,6 +51,93 @@ log_action() {
     ( umask 077; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${1:-}" >> "$LOG_FILE" )
 }
 
+proxy_unsigned_consent_saved() {
+    local owner mode saved
+    [[ -n "${PROXY_CONSENT_FILE:-}" && -f "$PROXY_CONSENT_FILE" && ! -L "$PROXY_CONSENT_FILE" ]] || return 1
+    owner=$(stat -c '%u' -- "$PROXY_CONSENT_FILE" 2>/dev/null) || return 1
+    mode=$(stat -c '%a' -- "$PROXY_CONSENT_FILE" 2>/dev/null) || return 1
+    [[ "$owner" == 0 && "$mode" == 600 ]] || return 1
+    IFS= read -r saved < "$PROXY_CONSENT_FILE" || return 1
+    [[ "$saved" == "yes" ]]
+}
+
+save_proxy_unsigned_consent() {
+    local tmp
+    tmp=$(mktemp "${LOG_DIR}/.allow-unsigned-proxy.XXXXXX") || return 1
+    if ! printf 'yes\n' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$PROXY_CONSENT_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+persist_github_source_mode() {
+    local mode="$1" mode_tmp=""
+    mode_tmp=$(mktemp "${LOG_DIR}/.github-source-mode.XXXXXX") || {
+        echo -e "${RED}[错误]${PLAIN} 无法创建 GitHub 源配置临时文件。" >&2
+        return 1
+    }
+    if ! printf '%s\n' "$mode" > "$mode_tmp" || ! chmod 600 "$mode_tmp" || ! mv -f -- "$mode_tmp" "$GITHUB_SOURCE_MODE_FILE"; then
+        rm -f -- "$mode_tmp"
+        echo -e "${RED}[错误]${PLAIN} 无法保存 GitHub 源配置；安装已停止，未开始同步。" >&2
+        return 1
+    fi
+}
+
+configure_github_source_mode() {
+    local requested="${EASY_VPN_GITHUB_SOURCE_MODE:-}" configured="direct" consent_saved=0
+    proxy_unsigned_consent_saved && consent_saved=1 || true
+    if [[ -n "$requested" ]]; then
+        case "$requested" in
+            china|direct) configured="$requested" ;;
+            *) echo -e "${RED}[错误]${PLAIN} EASY_VPN_GITHUB_SOURCE_MODE 仅允许 china 或 direct。" >&2; return 1 ;;
+        esac
+
+        # Without a maintainer signature, proxy use is an explicit trust decision.
+        # Reject before writing the source mode so a failed first attempt cannot trap future runs.
+        if [[ "$configured" == "china" && -z "$EASY_VPN_RELEASE_PUBKEY" && "${EASY_VPN_ALLOW_UNSIGNED_PROXY:-0}" != "1" && "$consent_saved" != "1" ]]; then
+            echo -e "${RED}[拒绝]${PLAIN} 当前没有配置发布签名，不能自动信任第三方国内加速源。" >&2
+            echo -e "${YELLOW}[提示]${PLAIN} 优先使用 README 中的 GitHub 官方源命令；若明确接受第三方代理以 root 权限提供脚本的风险，再按 README 设置 EASY_VPN_ALLOW_UNSIGNED_PROXY=1。" >&2
+            return 1
+        fi
+
+        if [[ "$configured" == "china" && -z "$EASY_VPN_RELEASE_PUBKEY" && "${EASY_VPN_ALLOW_UNSIGNED_PROXY:-0}" == "1" ]]; then
+            save_proxy_unsigned_consent || {
+                echo -e "${RED}[错误]${PLAIN} 无法安全保存国内代理风险确认；未开始同步。" >&2
+                return 1
+            }
+            log_action "[风险确认] 用户明确允许使用未签名的第三方国内加速源；同意记录保存在 ${PROXY_CONSENT_FILE}"
+        elif [[ "$configured" == "direct" ]]; then
+            # Selecting the official source revokes the previous unsigned-proxy opt-in.
+            if [[ -e "$PROXY_CONSENT_FILE" || -L "$PROXY_CONSENT_FILE" ]]; then
+                [[ -f "$PROXY_CONSENT_FILE" && ! -L "$PROXY_CONSENT_FILE" ]] || {
+                    echo -e "${RED}[错误]${PLAIN} 国内代理确认文件不是安全的普通文件：${PROXY_CONSENT_FILE}" >&2
+                    return 1
+                }
+                rm -f -- "$PROXY_CONSENT_FILE" || return 1
+            fi
+        fi
+    elif [[ -e "$GITHUB_SOURCE_MODE_FILE" || -L "$GITHUB_SOURCE_MODE_FILE" ]]; then
+        [[ -f "$GITHUB_SOURCE_MODE_FILE" && ! -L "$GITHUB_SOURCE_MODE_FILE" ]] || {
+            echo -e "${RED}[错误]${PLAIN} GitHub 源配置不是安全的普通文件：${GITHUB_SOURCE_MODE_FILE}" >&2; return 1;
+        }
+        IFS= read -r configured < "$GITHUB_SOURCE_MODE_FILE" || configured=""
+        case "$configured" in
+            china|direct) ;;
+            *) echo -e "${RED}[错误]${PLAIN} GitHub 源配置内容无效，请检查 ${GITHUB_SOURCE_MODE_FILE}。" >&2; return 1 ;;
+        esac
+        # Repair stale settings written by older builds before they rejected an unsigned proxy.
+        # Fall back to official HTTPS instead of leaving the user stuck in an unusable china mode.
+        if [[ "$configured" == "china" && -z "$EASY_VPN_RELEASE_PUBKEY" && "${EASY_VPN_ALLOW_UNSIGNED_PROXY:-0}" != "1" ]] && ! proxy_unsigned_consent_saved; then
+            echo -e "${YELLOW}[修复]${PLAIN} 发现未确认风险的国内源设置，已切回 GitHub 官方 HTTPS 源。" >&2
+            configured="direct"
+        fi
+    fi
+
+    persist_github_source_mode "$configured" || return 1
+    EASY_VPN_GITHUB_SOURCE_MODE="$configured"
+    export EASY_VPN_GITHUB_SOURCE_MODE
+}
+
 on_error() {
     local rc=$?
     local err_source="${BASH_SOURCE[1]-}"
@@ -49,6 +149,7 @@ on_error() {
     return "$rc"
 }
 trap on_error ERR
+configure_github_source_mode || exit 1
 
 install_dependencies() {
     local missing=() cmd
@@ -82,8 +183,39 @@ local_bundle_available() {
        -f "$dir/protocol_catalog.json" && ! -L "$dir/protocol_catalog.json" ]]
 }
 
-raw_base_url() {
+raw_direct_base_url() {
     printf 'https://raw.githubusercontent.com/%s/%s/%s' "$GITHUB_USER" "$GITHUB_REPO" "$EASY_VPN_BRANCH"
+}
+
+raw_base_url() {
+    local direct
+    direct=$(raw_direct_base_url)
+    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+        printf 'https://gh-proxy.org/%s' "$direct"
+    else
+        printf '%s' "$direct"
+    fi
+}
+
+download_bundle_file() {
+    local primary_base="$1" direct_base="$2" file="$3" output="$4" url
+    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+        # Do not append query parameters to the proxy URL: keep its nested target URL intact.
+        url="${primary_base}/${file}"
+        if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"; then
+            return 0
+        fi
+        rm -f -- "$output"
+        echo -e "${YELLOW}[国内加速回退]${PLAIN} 加速源下载 ${file} 失败，改用 GitHub 官方源重试。" >&2
+        url="${direct_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"
+    else
+        url="${primary_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"
+    fi
 }
 
 # Compare stable numeric version components; this is used only to prevent accidental downgrades.
@@ -100,9 +232,49 @@ easy_vpn_version_gt() {
     ((10#$a3 > 10#$b3))
 }
 
+# 第三方加速代理只允许在“能够校验内容真实性”的前提下使用：
+# 脚本最终以 root 身份执行，代理一旦返回被篡改的内容，bash -n / 版本号 / JSON 检查都挡不住。
+require_verifiable_remote_source() {
+    [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]] || return 0
+    [[ -z "$EASY_VPN_RELEASE_PUBKEY" ]] || return 0
+    if [[ "${EASY_VPN_ALLOW_UNSIGNED_PROXY:-0}" == "1" ]] || proxy_unsigned_consent_saved; then
+        echo -e "${YELLOW}[警告]${PLAIN} 正在使用未签名的第三方国内加速源；TLS 不能替代维护者发布签名。" >&2
+        log_action "[警告] 使用未签名的第三方国内加速源；执行前提为用户明确确认风险"
+        return 0
+    fi
+    echo -e "${RED}[拒绝]${PLAIN} 国内加速模式会让第三方代理提供将以 root 运行的脚本，而当前版本没有发布签名，无法独立验证内容真实性。" >&2
+    echo -e "${YELLOW}[提示]${PLAIN} 优先改用 GitHub 官方 HTTPS 源；如明确接受风险，请通过 README 中包含 EASY_VPN_ALLOW_UNSIGNED_PROXY=1 的国内命令重新选择。" >&2
+    return 1
+}
+
+# 校验已下载到目录 $1 的 SHA256SUMS / SHA256SUMS.sig，并核对其后列出的每个文件哈希。
+verify_bundle_signature() {
+    local dir="$1"; shift
+    local manifest="${dir}/SHA256SUMS" sig_b64="${dir}/SHA256SUMS.sig"
+    local sig_bin="${dir}/.SHA256SUMS.sig.bin" pubfile="${dir}/.release-public.pem"
+    local file expected actual
+    [[ -n "$EASY_VPN_RELEASE_PUBKEY" ]] || return 1
+    [[ -s "$manifest" && -s "$sig_b64" ]] || return 1
+    printf '%s\n' "$EASY_VPN_RELEASE_PUBKEY" > "$pubfile" || return 1
+    openssl base64 -d -A -in "$sig_b64" -out "$sig_bin" 2>/dev/null || { rm -f -- "$pubfile" "$sig_bin"; return 1; }
+    if ! openssl dgst -sha256 -verify "$pubfile" -signature "$sig_bin" "$manifest" >/dev/null 2>&1; then
+        rm -f -- "$pubfile" "$sig_bin"
+        return 1
+    fi
+    rm -f -- "$pubfile" "$sig_bin"
+    for file in "$@"; do
+        [[ -f "${dir}/${file}" && ! -L "${dir}/${file}" ]] || return 1
+        expected=$(awk -v f="$file" '$2 == f { print $1; exit }' "$manifest")
+        [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+        actual=$(sha256sum -- "${dir}/${file}" | awk '{print $1}')
+        [[ "$actual" == "$expected" ]] || return 1
+    done
+    return 0
+}
+
 sync_bundle() (
     set -Eeuo pipefail
-    local source_dir="${1:-}" base temp remote_version bundle_version catalog_version file
+    local source_dir="${1:-}" base direct_base temp remote_version bundle_version catalog_version file
     local backup_dir="" backup_has_old=0 keep_backup=0 commit_started=0 transaction_ok=0 rollback_failed=0
     local new_bytes=0 old_bytes=0 root_free_kb=0 log_free_kb=0 root_dev="" log_dev="" margin_bytes=$((1024 * 1024))
     local new_bytes_kb=0 old_bytes_kb=0 margin_kb=0
@@ -205,16 +377,39 @@ sync_bundle() (
             cp -p -- "${source_dir}/${file}" "${temp}/${file}"
         done
     else
+        require_verifiable_remote_source || return 1
         base=$(raw_base_url)
-        echo -e "${BLUE}[同步]${PLAIN} 从 GitHub 分支 ${EASY_VPN_BRANCH} 下载程序与协议文件。"
+        direct_base=$(raw_direct_base_url)
+        if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+            echo -e "${BLUE}[同步]${PLAIN} 优先通过国内加速源同步 Easy VPN 文件；单文件失败时将尝试官方直连源。"
+        else
+            echo -e "${BLUE}[同步]${PLAIN} 从 GitHub 分支 ${EASY_VPN_BRANCH} 下载程序与协议文件。"
+        fi
         for file in "${rels[@]}"; do
             mkdir -p "${temp}/$(dirname "$file")"
-            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-                --connect-timeout 10 --max-time 120 --retry 2 \
-                -o "${temp}/${file}" "${base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}" || {
-                echo -e "${RED}[错误]${PLAIN} 下载失败：${file}；当前文件未被替换，请检查网络和分支 ${EASY_VPN_BRANCH}。"; return 1;
-            }
+            if ! download_bundle_file "$base" "$direct_base" "$file" "${temp}/${file}"; then
+                rm -f -- "${temp}/${file}"
+                echo -e "${RED}[错误]${PLAIN} 下载失败：${file}；官方源/加速源均不可用，当前文件未被替换。"; return 1;
+            fi
         done
+        if [[ -n "$EASY_VPN_RELEASE_PUBKEY" ]]; then
+            for file in SHA256SUMS SHA256SUMS.sig; do
+                if ! download_bundle_file "$base" "$direct_base" "$file" "${temp}/${file}"; then
+                    rm -f -- "${temp}/${file}"
+                    echo -e "${RED}[错误]${PLAIN} 下载发布签名文件失败：${file}；当前文件未被替换。"; return 1;
+                fi
+            done
+            verify_bundle_signature "$temp" "${rels[@]}" || {
+                echo -e "${RED}[签名校验失败]${PLAIN} 远端文件与发布签名不一致（可能被代理/镜像篡改，或维护者尚未重新签名发布）；已拒绝同步，当前安装保持不变。"; return 1;
+            }
+            echo -e "${GREEN}[签名校验]${PLAIN} 发布签名与全部文件哈希校验通过。"
+        else
+            if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+                echo -e "${YELLOW}[警告]${PLAIN} 本发布包未启用签名校验，且文件来自第三方加速源，内容真实性无法验证。"
+            else
+                echo -e "${YELLOW}[提示]${PLAIN} 本发布包未启用签名校验，仅依赖 GitHub 官方 HTTPS 源保证来源。"
+            fi
+        fi
     fi
 
     for file in "${temp}/install.sh" "${temp}/lib/common.sh" "${temp}/modules/protocol.sh"; do
@@ -398,10 +593,43 @@ install_shortcut() {
     fi
 }
 
+install_uppercase_shortcut() {
+    local tmp shortcut_dir
+    [[ "$UPPERCASE_SHORTCUT" != "$SHORTCUT" ]] || return 0
+    if [[ -L "$UPPERCASE_SHORTCUT" || ( -e "$UPPERCASE_SHORTCUT" && ! -f "$UPPERCASE_SHORTCUT" ) ]]; then
+        echo -e "${RED}[错误]${PLAIN} ${UPPERCASE_SHORTCUT} 存在且不是安全的普通文件，拒绝覆盖。"; return 1
+    fi
+    if [[ -f "$UPPERCASE_SHORTCUT" ]] && ! grep -Fq "${LOCAL_ROOT}/install.sh" "$UPPERCASE_SHORTCUT"; then
+        mkdir -p "${LOG_DIR}/backups/shortcut-uppercase"
+        [[ -f "${LOG_DIR}/backups/shortcut-uppercase/original" ]] || cp -a -- "$UPPERCASE_SHORTCUT" "${LOG_DIR}/backups/shortcut-uppercase/original"
+        touch "${LOG_DIR}/backups/shortcut-uppercase/present"
+    fi
+    tmp=$(mktemp) || { echo -e "${RED}[错误]${PLAIN} 无法创建大写快捷命令临时文件。" >&2; return 1; }
+    if ! printf '#!/usr/bin/env bash\nexec %q "$@"\n' "${LOCAL_ROOT}/install.sh" > "$tmp"; then
+        rm -f -- "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 无法写入大写快捷命令临时文件。" >&2
+        return 1
+    fi
+    shortcut_dir="${UPPERCASE_SHORTCUT%/*}"
+    [[ -n "$shortcut_dir" ]] || shortcut_dir="/"
+    if ! mkdir -p -- "$shortcut_dir"; then
+        rm -f -- "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 无法创建快捷命令目录：${shortcut_dir}" >&2
+        return 1
+    fi
+    if ! install -m 755 -- "$tmp" "$UPPERCASE_SHORTCUT"; then
+        rm -f -- "$tmp"
+        echo -e "${RED}[错误]${PLAIN} 无法安装大写快捷命令：${UPPERCASE_SHORTCUT}" >&2
+        return 1
+    fi
+    rm -f -- "$tmp"
+}
+
 install_dependencies
 if [[ "${1:-}" == "--update-return" ]]; then
     sync_bundle "" remote || exit $?
     install_shortcut
+    install_uppercase_shortcut
     exit $?
 fi
 
@@ -422,6 +650,7 @@ export EASY_VPN_ETC="$LOG_DIR"
 source "${LOCAL_LIB}/common.sh"
 source "${LOCAL_MODULES}/protocol.sh"
 install_shortcut
+install_uppercase_shortcut
 
 # Dispatch non-interactive actions from the actual public entrypoint. The shortcut
 # forwards all arguments here, and the bootstrap installer preserves them on exec.
@@ -435,12 +664,13 @@ dispatch_cli_command() {
         --help|-h)
             cat <<'USAGE'
 Easy VPN usage:
-  vpn                       Open the interactive menu
-  vpn --pipeline-reality    Deploy VLESS + Reality in pipeline mode
+  VPN                       Open the interactive menu (uppercase alias)
+  vpn                       Open the interactive menu (lowercase alias)
+  VPN --pipeline-reality    Deploy VLESS + Reality in pipeline mode
 
 Pipeline mode can use EASY_VPN_SERVER_IP to explicitly provide the public
 server address if automatic public-IP detection is unavailable, for example:
-  EASY_VPN_SERVER_IP=203.0.113.10 vpn --pipeline-reality
+  EASY_VPN_SERVER_IP=203.0.113.10 VPN --pipeline-reality
 USAGE
             return 0
             ;;
@@ -462,14 +692,14 @@ fi
 # curl | sudo bash leaves stdin at EOF after the downloaded installer has been read.
 # Restore the controlling terminal for the interactive menu when one exists. In a
 # non-interactive session (e.g. automation without a controlling TTY), finish the
-# installation successfully and tell the user to start the menu later with `vpn`.
+# installation successfully and tell the user to start the menu later with `VPN` or `vpn`.
 if [[ ! -t 0 ]]; then
     tty_device="${EASY_VPN_TTY_DEVICE:-/dev/tty}"
     if { exec 3<"$tty_device"; } 2>/dev/null; then
         exec 0<&3
         exec 3<&-
     else
-        echo -e "${GREEN}[完成]${PLAIN} Easy VPN 已安装；当前会话没有可交互终端。请在终端中运行 ${CYAN}vpn${PLAIN} 打开菜单。"
+        echo -e "${GREEN}[完成]${PLAIN} Easy VPN 已安装；当前会话没有可交互终端。请在终端中输入 ${CYAN}VPN${PLAIN}（或 ${CYAN}vpn${PLAIN}）打开菜单。"
         exit 0
     fi
 fi
