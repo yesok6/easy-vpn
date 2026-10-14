@@ -1,8 +1,31 @@
 # Easy VPN
 
-**版本：1.0.13**
+**版本：1.0.17**
 
 Easy VPN 是独立的 VPS 协议搭建与节点管理项目。启动后直接进入协议菜单，不包含 SSH 管理、系统安全、网络优化或 IP 测试等通用运维模块。
+
+## 1.0.17 端口跳跃取消与测试输出修复
+
+- 修复在 Hysteria 2 部署时，于端口跳跃范围提示按 `Ctrl+D` 导致部署流程异常继续或退出的问题；现在明确取消本次部署，并返回主菜单。
+- 将冒烟测试的 `OK` 提示移到所有回归测试之后，避免后续测试失败时提前显示成功。
+- 发布签名仍为维护者可选功能；此版本未配置维护者公钥，不应声称已启用签名校验。
+
+## 1.0.16 稳定性与下载源修复版
+
+- **发布签名为可选维护者功能**：代码支持 ECDSA P-256 签名校验，但本 ZIP 未配置维护者公钥，也没有随包提供签名清单，因此不能声称当前版本已启用发布签名。
+- **国内加速需要明确接受风险**：没有签名公钥时，第三方代理提供的安装脚本无法独立证明来自维护者。国内安装命令会显式设置 `EASY_VPN_ALLOW_UNSIGNED_PROXY=1`；安装器会在日志中记录此选择，并将其保存为权限为 `600` 的本地确认记录。若不愿承担该风险，请使用 GitHub 官方 HTTPS 源。
+- **修复国内源状态卡住问题**：未明确确认风险时，不会保存国内代理设置；旧版本遗留的未确认 `china` 设置会自动切回官方 HTTPS 源。明确切换到官方源会撤销此前的未签名代理确认。
+- **Hysteria 2 / TUIC 证书指纹固定**：Hysteria 2 分享链接增加 `pinSHA256` 参数；节点信息显示证书 SHA-256 指纹；导出的 Clash/Mihomo 配置对 Hysteria 2 和 TUIC 都加入 `fingerprint`。客户端因此能识别并拒绝中间人冒充的服务器，而不再是“完全不验证证书”。
+- **不再盲目复用系统里的 sing-box**：优先使用本工具安装并校验过的内核；只有系统里的 `sing-box` 及其所在目录都归 root 所有、且组/其他用户不可写时才复用，否则改为下载并校验官方版本。
+- `SINGBOX_VERSION` 必须是 `X.Y.Z` 稳定版本号，不再被原样拼进下载地址。
+- 通过 `EASY_VPN_SERVICE_HARDENING=off` 关闭 systemd 沙盒时会明确警告并写入日志。
+- 新增维护者工具 `tools/release.sh`（生成密钥、写入公钥、签名、自检），不会被安装到用户的 VPS 上。
+
+## 1.0.14 快捷启动提示与命令兼容性
+
+- 安装后同时提供大写 `VPN` 和小写 `vpn` 两个快捷命令，避免用户按界面提示输入大写命令却因 Linux 命令区分大小写而失败。
+- 主菜单“0. 退出”旁增加绿色快捷启动提示；VPS 概况末尾也会重复提示，方便用户下次打开终端直接输入命令。
+- 无交互终端安装完成时，也会提示使用 `VPN`（或 `vpn`）重新打开菜单。
 
 ## 1.0.13 国内加速安装
 
@@ -65,9 +88,52 @@ Easy VPN 协议搭建工具
 ## 端口与证书说明
 
 - VLESS + Reality 可使用标准 TCP 443 端口；服务以专用 `easy-vpn` 用户运行，并仅获得绑定低位端口所需的 `CAP_NET_BIND_SERVICE` 能力。80 也允许使用，但通常不会替代 HTTPS 443。
-- Hysteria 2 和 TUIC v5 自签名证书采用最长 365 天有效期，SNI 从可用候选中选择；分享链接仍会明确标记使用自签名证书需要跳过证书验证。该调整是证书生命周期与配置卫生改进，不应视为规避流量识别的保证。
+- Hysteria 2 和 TUIC v5 自签名证书采用最长 365 天有效期，SNI 从可用候选中选择。该调整是证书生命周期与配置卫生改进，不应视为规避流量识别的保证。
+- 自签名证书无法被系统 CA 验证，所以分享链接仍带有 `insecure=1` / `allow_insecure=1`；为避免因此被中间人冒充，Hysteria 2 链接额外带有 `pinSHA256`，节点信息里也会显示证书指纹。请使用支持证书指纹固定的客户端，并确认它确实读取了该参数。TUIC 链接没有通用的固定参数，请在客户端的“证书指纹 / pin”设置里手动填入节点信息中的指纹；导出的 Clash/Mihomo 配置已自动包含。
+- 证书 365 天后到期。多数客户端在“固定指纹”模式下不检查有效期，但仍建议到期前移除并重新部署协议，然后重新导入新的节点链接（指纹会随新证书变化）。
 
-## 安装
+## 安装方式
+
+### 一键安装（GitHub 官方源）
+
+适用于 VPS 可以直接访问 GitHub Raw 的情况：
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
+```
+
+### 一键安装（国内网络加速）
+
+国内网络可使用以下命令。安装脚本和后续 Easy VPN 项目文件同步会优先通过 GH-Proxy 获取；下载单个项目文件失败时，安装器会尝试回退到 GitHub 官方 Raw 源。加速源选择会保存到 `/etc/easy-vpn/github-source-mode`，之后菜单中的程序版本和协议清单检查也会沿用这一设置。
+
+> **安全提醒：** 这条命令会从第三方加速服务取得将以 root 权限执行的初始脚本。本 ZIP 没有配置发布签名公钥，所以此模式无法独立验证代理返回的脚本确实来自维护者。只有在你明确接受这项信任风险时才使用；安装器会保存该选择，供之后更新时沿用。
+
+```bash
+curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china EASY_VPN_ALLOW_UNSIGNED_PROXY=1 bash
+```
+
+仓库和分支已固定为本项目的 `yesok6/easy-vpn` 与 `main`，不需要填写用户名或仓库名。如果初始安装脚本本身无法从加速服务下载，可将链接里的 `https://gh-proxy.org/` 前缀去掉，改用 GitHub 官方 Raw 地址重新获取安装脚本。
+
+**首次引导的信任问题：** 只有维护者配置了公钥、并发布匹配的签名文件时，安装器才会验证后续同步文件与更新；当前 ZIP 未配置公钥，所以当前版本尚未启用这层签名保护。第一次用 `curl | sudo bash` 取得的 `install.sh` 本身，无论如何都需要信任所选下载渠道。想要更稳妥，请先下载，再与项目发布说明中通过独立可信渠道公布的哈希比对后执行：
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" -o install.sh
+sha256sum install.sh        # 与项目发布页公布的 install.sh SHA-256 比对一致后再继续
+sudo bash install.sh
+```
+
+### 可选的发布签名（进阶维护者功能）
+
+当前 ZIP 的公钥为空，未附带 `SHA256SUMS` / `SHA256SUMS.sig`，所以当前发布并未启用签名验证。签名流程可以以后再配置，不是普通用户安装的必要步骤；不要为了让安装通过而伪造或随意填写公钥。
+
+如果维护者准备长期启用签名，再按以下流程操作：
+
+1. 在自己可信的维护电脑上运行 `bash tools/release.sh init-key`。私钥保存在 `~/.easy-vpn-release/release-private.pem`（权限 600）。**绝不要把私钥上传到 GitHub、放进 VPS 或发给任何人**，并做好离线备份。
+2. 每次发布前运行 `bash tools/release.sh release`。它会把公钥写进 `install.sh`，生成 `SHA256SUMS` 和 `SHA256SUMS.sig` 并自检。
+3. 将 `install.sh`、`lib/common.sh`、`modules/protocol.sh`、`protocol_catalog.json`、`VERSION`、`SHA256SUMS` 和 `SHA256SUMS.sig` 一起提交。以后修改任何受签名文件都必须重新签名。
+4. 首次 `curl | sudo bash` 仍要信任你获取初始脚本的下载渠道；签名机制主要保护安装器后续获取的项目文件与更新。
+
+### ZIP 安装（备用方式）
 
 从 GitHub 下载 ZIP 并解压，在项目目录执行：
 
@@ -75,35 +141,23 @@ Easy VPN 协议搭建工具
 sudo bash install.sh
 ```
 
-安装器会将运行文件安装到 `/opt/easy-vpn`，运行日志和配置状态放在 `/etc/easy-vpn`，并创建快捷命令 `vpn`（默认位于 `/usr/local/bin/vpn`）。交互式终端会直接显示协议菜单；通过管道安装时，安装器会尝试重新连接当前终端。如果没有可交互终端，则完成安装并提示之后运行 `vpn`，不会因 stdin EOF 假装进入菜单后闪退。
-
-### 一键安装
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china bash
-```
-
-### 一键安装（国内网络加速）
-
-vps在国内网络推荐使用以下命令。安装脚本和后续 Easy VPN 项目文件同步会优先通过 GH-Proxy 获取；下载单个项目文件失败时，安装器会尝试回退到 GitHub 官方 Raw 源。加速源选择会保存到 `/etc/easy-vpn/github-source-mode`，之后菜单中的程序版本和协议清单检查也会沿用这一设置。
-
-```bash
-curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china bash
-```
-
-仓库和分支已固定为本项目的 `yesok6/easy-vpn` 与 `main`，不需要填写用户名或仓库名。GH-Proxy 是第三方公共加速服务；如果初始安装脚本本身无法从加速服务下载，可将链接里的 `https://gh-proxy.org/` 前缀去掉，改用 GitHub 官方 Raw 地址重新获取安装脚本。
+安装器会将运行文件安装到 `/opt/easy-vpn`，运行日志和配置状态放在 `/etc/easy-vpn`，并创建 `VPN` 与 `vpn` 两个快捷命令（默认位于 `/usr/local/bin/VPN` 与 `/usr/local/bin/vpn`）。交互式终端会直接显示协议菜单；通过管道安装时，安装器会尝试重新连接当前终端。如果没有可交互终端，则完成安装并提示之后输入 `VPN`（或 `vpn`），不会因 stdin EOF 假装进入菜单后闪退。
 
 菜单第 6 项会分别检查 Easy VPN 程序版本、已实现协议适配版本，以及 sing-box 内核的最新稳定版本。发现程序更新时，选择 `1` 并输入 `Y` 才会更新；程序和协议适配已是最新版本时，可选择 `2` 并输入 `Y` 重装当前远端最新版，输入 `N` 则取消。sing-box 内核目前只检查并提示，不会随程序更新自动替换。
 
 更新与重装都会先下载全部项目文件到临时目录，检查 HTTPS 下载结果、版本一致性、协议清单 JSON、Bash 语法和磁盘空间；随后备份旧程序文件，再逐个原子替换，最后进行模块加载健康检查。若切换或健康检查失败，会尝试恢复已替换的旧文件。配置、节点信息、证书、私钥和正在运行的 sing-box 服务不会被更新流程主动修改。更新前的程序文件备份保存在 `/etc/easy-vpn/backups/`。若自动回滚也失败，会明确提示保留的备份路径。此流程降低更新风险，但不能替代 VPS 快照/异地备份。
 
-Easy VPN 项目更新默认使用固定的 `main` 分支，并沿用已保存的国内加速源设置。检查 sing-box 版本时优先使用 GitHub Release API；API 限流或不可用时，会回退读取 GitHub `releases/latest` 重定向并确认对应架构的资产存在。获取 SHA-256 时也会尝试 Release 页面公开的资产 digest；任何路径都不会在默认设置下跳过内核文件校验。
+Easy VPN 项目更新默认使用固定的 `main` 分支，并沿用已保存的下载源设置；仅在安装器配置了发布公钥时，更新才会强制校验 `SHA256SUMS.sig` 和全部文件哈希。本 ZIP 当前没有配置公钥，官方源模式依赖 GitHub HTTPS，国内第三方代理模式依赖用户的明确风险确认。从本地 ZIP 解压目录安装属于用户自己提供的文件，不做远程签名校验。检查 sing-box 版本时优先使用 GitHub Release API；API 限流或不可用时，会回退读取 GitHub `releases/latest` 重定向并确认对应架构的资产存在。获取 SHA-256 时也会尝试 Release 页面公开的资产 digest；任何路径都不会在默认设置下跳过内核文件校验。
 
 ## 如何发布新协议与更新
 
-新增协议不能只改 `protocol_catalog.json`：还必须在 `modules/protocol.sh` 中实现部署、配置校验、节点信息和移除逻辑，并通过测试。发布时同步更新 `install.sh` 中的 `CURRENT_VERSION`、`VERSION` 和 `protocol_catalog.json` 中的 `tool_version`，三个版本号必须一致，再提交到 GitHub 默认分支。
+新增协议不能只改 `protocol_catalog.json`：还必须在 `modules/protocol.sh` 中实现部署、配置校验、节点信息和移除逻辑，并通过测试。发布时同步更新 `install.sh` 中的 `CURRENT_VERSION`、`VERSION` 和 `protocol_catalog.json` 中的 `tool_version`，三个版本号必须一致。若维护者已启用发布签名，则运行 `bash tools/release.sh release` 重新生成签名并自检；未启用签名时不要伪造签名文件，并须如实说明当前发布的校验方式。最后再提交到 GitHub 默认分支。
 
 用户进入菜单后选择第 6 项，Easy VPN 会检查远端版本、协议清单和 sing-box 内核版本。发现程序或协议实现更新时，会询问是否更新；确认后下载对应程序文件并重新载入时生效。清单里标记为未实现的计划协议不会被当作可用新协议。sing-box 内核的版本检查与 Easy VPN 程序更新分开处理，当前不会自动替换内核。
+
+## 快捷启动
+
+安装完成后，可在 VPS 终端输入 `VPN` 或 `vpn` 打开菜单。两个命令都支持；菜单顶部和“0. 退出”旁也会以绿色提示快捷启动方式。
 
 ## 安装路径
 
@@ -117,7 +171,7 @@ Easy VPN 项目更新默认使用固定的 `main` 分支，并沿用已保存的
 ├── modules/
 │   └── protocol.sh
 └── bin/
-    └── sing-box          # 部署时由 Easy VPN 安装；若系统已有则可能复用系统版本
+    └── sing-box          # 部署时由 Easy VPN 下载并校验 SHA-256；仅当系统已有仅 root 可写的 sing-box 时才可能复用
 
 /etc/easy-vpn/
 ├── install.log
@@ -145,12 +199,33 @@ install.sh
 VERSION
 README.md
 protocol_catalog.json
+SHA256SUMS            # 发布时由 tools/release.sh 生成
+SHA256SUMS.sig        # 对 SHA256SUMS 的 ECDSA 签名（base64）
 lib/common.sh
 modules/protocol.sh
+tools/release.sh      # 维护者发布/签名工具（不会安装到 VPS）
 tests_smoke.sh
 ```
 
 `lib/common.sh` 是协议模块依赖的公共函数库；本项目包不包含其他通用运维模块。
+
+## 安全设计与已知限制
+
+已做到：
+
+- 内核 `sing-box` 下载后强制校验 SHA-256；服务以专用低权限账户运行，并启用 systemd 沙盒加固。
+- 程序更新有防降级、原子替换和自动回滚；只有维护者配置发布公钥后才会强制执行签名校验。
+- 未配置公钥时，第三方加速源必须由用户明确确认风险；确认会被本地保存，切回官方源可撤销。
+- Hysteria 2 / TUIC 的自签名证书支持指纹固定，抵御中间人冒充。
+- 复用系统 sing-box 前检查文件和目录的所有权与写权限。
+
+仍需你知道的限制：
+
+- 首次 `curl | sudo bash` 取得的 `install.sh` 无法被自身验证，请按上文先核对哈希。
+- sing-box 的 SHA-256 来自与二进制相同的 GitHub 发布源，它能防下载损坏和传输篡改，但防不了上游发布本身被投毒。
+- 流水线模式 `--pipeline-reality` 会把 UUID、公钥和分享链接打印到标准输出；在 CI 或会保存日志的环境里使用时，请对输出做保密处理。
+- 私钥一旦泄露，攻击者即可签发恶意更新；请妥善保管并按需轮换。
+- 本工具不能替代 VPS 快照、云防火墙/安全组配置和系统自身的安全更新。
 
 ## 验证
 
@@ -158,6 +233,7 @@ tests_smoke.sh
 bash -n install.sh
 bash -n lib/common.sh
 bash -n modules/protocol.sh
+bash -n tools/release.sh
 jq empty protocol_catalog.json
 sudo bash tests_smoke.sh
 ```
