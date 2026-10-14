@@ -16,19 +16,82 @@ SERVICE_FILE="${EASY_VPN_SERVICE_FILE:-${SYSTEMD_DIR}/${SERVICE_UNIT}}"
 SINGBOX_BIN=""
 PROTOCOL_CATALOG_FILE="${EASY_VPN_ROOT}/protocol_catalog.json"
 PROTOCOL_BRANCH="${EASY_VPN_BRANCH:-main}"
-PROTOCOL_CATALOG_URL="${EASY_VPN_PROTOCOL_CATALOG_URL:-https://raw.githubusercontent.com/${EASY_VPN_GITHUB_USER:-yesok6}/${EASY_VPN_GITHUB_REPO:-easy-vpn}/${PROTOCOL_BRANCH}/protocol_catalog.json}"
 
-resolve_singbox() {
-    if [[ -n "${SINGBOX_BIN:-}" && -x "$SINGBOX_BIN" ]]; then return 0; fi
-    if command_exists sing-box; then
-        SINGBOX_BIN="$(command -v sing-box)"
+easy_vpn_project_raw_url() {
+    local path="${1#/}" direct
+    direct="https://raw.githubusercontent.com/${EASY_VPN_GITHUB_USER:-yesok6}/${EASY_VPN_GITHUB_REPO:-easy-vpn}/${PROTOCOL_BRANCH}/${path}"
+    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+        printf 'https://gh-proxy.org/%s' "$direct"
+    else
+        printf '%s' "$direct"
+    fi
+}
+
+easy_vpn_project_direct_raw_url() {
+    local path="${1#/}"
+    printf 'https://raw.githubusercontent.com/%s/%s/%s/%s' \
+        "${EASY_VPN_GITHUB_USER:-yesok6}" "${EASY_VPN_GITHUB_REPO:-easy-vpn}" "$PROTOCOL_BRANCH" "$path"
+}
+
+fetch_easy_vpn_project_file() {
+    local primary_url="$1" direct_url="$2" output="$3"
+    if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 5 --max-time 15 --retry 2 -o "$output" "$primary_url"; then
         return 0
     fi
+    rm -f -- "$output"
+    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" && "$primary_url" != "$direct_url" ]]; then
+        echo -e "${YELLOW}[国内加速回退]${PLAIN} 项目文件获取失败，改用 GitHub 官方源重试。" >&2
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 5 --max-time 15 --retry 1 -o "$output" "$direct_url"
+    else
+        return 1
+    fi
+}
+
+PROTOCOL_CATALOG_URL="${EASY_VPN_PROTOCOL_CATALOG_URL:-$(easy_vpn_project_raw_url protocol_catalog.json)}"
+
+# 复用系统里已有的 sing-box 前必须确认它“只有 root 能改”：该文件及其所在目录都归 root 所有，
+# 且组/其他用户不可写。否则任何能写入该文件的用户都能借 easy-vpn 服务账户执行任意代码。
+singbox_binary_is_trusted() {
+    local path="${1:-}" real owner mode dir dir_owner dir_mode
+    real=$(readlink -f -- "$path" 2>/dev/null) || return 1
+    [[ -f "$real" && -x "$real" ]] || return 1
+    read -r owner mode < <(stat -c '%u %a' -- "$real" 2>/dev/null) || return 1
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 8#022) == 0 )) || return 1
+    dir=$(dirname -- "$real")
+    read -r dir_owner dir_mode < <(stat -c '%u %a' -- "$dir" 2>/dev/null) || return 1
+    [[ "$dir_owner" == 0 && "$dir_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$dir_mode & 8#022) == 0 ))
+}
+
+resolve_singbox() {
+    local candidate
+    if [[ -n "${SINGBOX_BIN:-}" && -x "$SINGBOX_BIN" ]]; then return 0; fi
+    # 优先使用本工具安装并校验过 SHA-256 的内核。
     if [[ -x "${EASY_VPN_ROOT}/bin/sing-box" ]]; then
         SINGBOX_BIN="${EASY_VPN_ROOT}/bin/sing-box"
         return 0
     fi
+    if command_exists sing-box; then
+        candidate="$(command -v sing-box)"
+        if singbox_binary_is_trusted "$candidate"; then
+            SINGBOX_BIN="$candidate"
+            return 0
+        fi
+        echo -e "${YELLOW}[提示]${PLAIN} 系统中的 sing-box（${candidate}）不是仅 root 可写，出于安全考虑不复用，将改为下载并校验官方版本。" >&2
+    fi
     return 1
+}
+
+# 输出证书的 SHA-256 指纹（大写十六进制、无冒号），用于客户端固定自签名证书。
+cert_sha256_fingerprint() {
+    local cert="${1:-}" fp
+    [[ -f "$cert" ]] || return 1
+    fp=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | sed -n 's/^.*=//p' | tr -d ':' | tr 'a-f' 'A-F')
+    [[ "$fp" =~ ^[0-9A-F]{64}$ ]] || return 1
+    printf '%s\n' "$fp"
 }
 
 github_release_api_json() {
@@ -231,6 +294,10 @@ install_singbox() {
             *) echo -e "${RED}[错误]${PLAIN} 不支持的 CPU 架构。"; return 1 ;;
         esac
         version="${SINGBOX_VERSION:-}"
+        if [[ -n "$version" && ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo -e "${RED}[错误]${PLAIN} SINGBOX_VERSION 必须是 X.Y.Z 形式的稳定版本号（当前：${version}）。" >&2
+            return 1
+        fi
         [[ -n "$version" ]] || version=$(latest_singbox_version)
         asset="sing-box-${version}-linux-${arch}.tar.gz"
         asset_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${asset}"
@@ -306,6 +373,8 @@ install_singbox() {
     local service_hardening="${EASY_VPN_SERVICE_HARDENING:-on}"
     case "${service_hardening,,}" in
         off|0|false|no)
+            echo -e "${YELLOW}[警告]${PLAIN} EASY_VPN_SERVICE_HARDENING 已关闭：sing-box 服务将不使用 systemd 沙盒加固，仅建议用于排障。" >&2
+            log_action "[警告] 本次生成的 systemd 服务关闭了安全加固（EASY_VPN_SERVICE_HARDENING=${service_hardening}）"
             cat > "$SERVICE_FILE" <<EOF2
 [Unit]
 Description=Easy VPN sing-box service
@@ -896,7 +965,10 @@ prompt_port_hopping() {
     read -rp "是否启用 UDP 端口跳跃（可缓解晚高峰 UDP 限速）？[Y/n]: " choice || { echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口跳跃选择。"; return 1; }
     [[ "$choice" =~ ^[Nn]$ ]] && return 0
     while true; do
-        read -rp "输入端口范围（例如 20000-20100，跨度 ≤ 200）：" range
+        read -rp "输入端口范围（例如 20000-20100，跨度 ≤ 200）：" range || {
+            echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口范围输入。"
+            return 1
+        }
         if [[ -z "$range" ]]; then
             ((blank_attempts += 1))
             echo -e "${YELLOW}[提示]${PLAIN} 必须输入端口范围。"
@@ -1867,7 +1939,7 @@ show_protocol_qr_menu() {
 }
 
 generate_clash_yaml() {
-    local file tmp name node_file server port uuid password sni public_key short_id range
+    local file tmp name node_file server port uuid password sni public_key short_id range cert_fp
     local count=0
     local -a proxies=()
     local -a names=()
@@ -1896,6 +1968,8 @@ generate_clash_yaml() {
         port=$(node_info_value "$node_file" '连接端口')
         [[ -n "$port" ]] || port=$(node_info_value "$node_file" 'UDP 端口')
         sni=$(node_info_value "$node_file" 'SNI')
+        cert_fp=$(node_info_value "$node_file" '证书指纹 (SHA-256)')
+        [[ "$cert_fp" =~ ^[0-9A-F]{64}$ ]] || cert_fp=""
         case "$name" in
             vless)
                 uuid=$(node_info_value "$node_file" '用户 ID (UUID)')
@@ -1941,6 +2015,7 @@ generate_clash_yaml() {
                     echo "    sni: $(yaml_quote "$sni")"
                     echo "    alpn: [h3]"
                     echo "    skip-cert-verify: true"
+                    [[ -n "$cert_fp" ]] && echo "    fingerprint: $(yaml_quote "$cert_fp")"
                     range=$(state_get "$(protocol_hop_state_key hy2)" 2>/dev/null || true)
                     [[ -n "$range" ]] && echo "    ports: $(yaml_quote "$range")"
                 } >> "$tmp"
@@ -1966,6 +2041,7 @@ generate_clash_yaml() {
                     echo "    alpn: [h3]"
                     echo "    sni: $(yaml_quote "$sni")"
                     echo "    skip-cert-verify: true"
+                    [[ -n "$cert_fp" ]] && echo "    fingerprint: $(yaml_quote "$cert_fp")"
                 } >> "$tmp"
                 proxies+=(EasyVPN-TUICv5)
                 ((count+=1))
@@ -2215,7 +2291,7 @@ deploy_hysteria2() {
     echo -e "${CYAN}                [Hysteria 2]                       ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port password cert_file key_file server_ip uri_host sni="" hop_range=""
+    local default_port input_port port password cert_file key_file server_ip uri_host sni="" hop_range="" cert_fp=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，允许 80、443 或 1024-65535]: " input_port || { echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口输入。"; return 1; }
@@ -2223,7 +2299,12 @@ deploy_hysteria2() {
     validate_user_port "$port" || { echo -e "${RED}[错误]${PLAIN} 端口无效。"; return 1; }
     port_in_use "$port" udp && { echo -e "${RED}[错误]${PLAIN} UDP 端口已被占用。"; return 1; }
     state_exists protocol_hy2 && { echo -e "${YELLOW}[提示]${PLAIN} Hysteria 2 已经部署。若需更换端口、SNI 或凭据，请先选择“5. 移除协议 / 清理全部”移除它，再重新部署；移除过程中服务会短暂重启，完成后需要重新导入新的节点链接。"; return 1; }
-    if [[ -z "${EASY_VPN_PIPELINE:-}" ]]; then prompt_port_hopping 1; hop_range="${PORT_HOP_RANGE:-}"; else hop_range=""; fi
+    if [[ -z "${EASY_VPN_PIPELINE:-}" ]]; then
+        prompt_port_hopping 1 || return 1
+        hop_range="${PORT_HOP_RANGE:-}"
+    else
+        hop_range=""
+    fi
     check_protocol_resources hy2 || return 1
 
     install_singbox || return 1
@@ -2336,7 +2417,13 @@ deploy_hysteria2() {
     state_set protocol_hy2 1
     state_set protocol_hy2_port "$port"
     local hy2_link
+    cert_fp=$(cert_sha256_fingerprint "$cert_file" || true)
     hy2_link="hysteria2://${password}@${uri_host}:${port}/?insecure=1&sni=${sni}"
+    if [[ -n "$cert_fp" ]]; then
+        hy2_link+="&pinSHA256=${cert_fp}"
+    else
+        echo -e "${YELLOW}[警告]${PLAIN} 无法计算证书指纹，分享链接不含证书固定，客户端将无法识别中间人冒充。" >&2
+    fi
     [[ -n "$hop_range" ]] && hy2_link+="&mport=${hop_range}"
     hy2_link+="#EasyVPN-Hysteria2"
     if ! write_protocol_node_info hy2 "===================== 节点连接信息 =====================
@@ -2347,7 +2434,8 @@ UDP 端口: ${port}
 连接密码: ${password}
 SNI: ${sni}
 端口跳跃: ${hop_range:-未启用}
-说明: 使用本工具生成的自签名证书，因此客户端链接包含 insecure=1。
+证书指纹 (SHA-256): ${cert_fp:-未能计算}
+说明: 使用本工具生成的自签名证书，因此客户端链接包含 insecure=1；链接同时带有 pinSHA256 证书指纹，客户端据此固定服务器证书，防止中间人冒充。
 
 【一键导入分享链接】:
 ${hy2_link}
@@ -2369,7 +2457,7 @@ deploy_tuic_v5() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${BLUE}[说明]${PLAIN} 面向游戏/实时 UDP 场景，使用原生 UDP 中继；0-RTT 默认关闭以避免重放风险。"
 
-    local default_port input_port port password uuid cert_file key_file server_ip uri_host sni=""
+    local default_port input_port port password uuid cert_file key_file server_ip uri_host sni="" cert_fp=""
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，允许 80、443 或 1024-65535]: " input_port || { echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口输入。"; return 1; }
@@ -2481,6 +2569,7 @@ deploy_tuic_v5() {
     state_set protocol_tuic 1
     state_set protocol_tuic_port "$port"
     local tuic_link
+    cert_fp=$(cert_sha256_fingerprint "$cert_file" || true)
     tuic_link="tuic://${uuid}:${password}@${uri_host}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1"
     tuic_link+="#EasyVPN-TUICv5"
     if ! write_protocol_node_info tuic "===================== 节点连接信息 =====================
@@ -2496,7 +2585,8 @@ UDP 中继: native（原生 UDP）
 ALPN: h3
 SNI: ${sni}
 端口跳跃: 不支持（TUIC v5 客户端无通用原生多端口跳跃配置）
-说明: 使用本工具生成的自签名证书，因此客户端链接包含 allow_insecure=1。
+证书指纹 (SHA-256): ${cert_fp:-未能计算}
+说明: 使用本工具生成的自签名证书，因此客户端链接包含 allow_insecure=1（TUIC 链接没有通用的证书固定参数；客户端支持“证书指纹/pin”时请填入上方指纹，导出的 Clash/Mihomo 配置已自动包含）。
 
 【一键导入分享链接】:
 ${tuic_link}
@@ -2674,27 +2764,33 @@ protocol_update_check() {
     local tmp remote_tool local_tool remote_catalog_tool singbox_local singbox_latest version_url
     local new_protocols=() adapter_updates=() remote_id remote_name remote_ver local_ver item
     local app_update=0 catalog_change=0 singbox_update=0 choice confirm
-    version_url="${EASY_VPN_VERSION_URL:-https://raw.githubusercontent.com/${EASY_VPN_GITHUB_USER:-yesok6}/${EASY_VPN_GITHUB_REPO:-easy-vpn}/${PROTOCOL_BRANCH}/VERSION}"
+    version_url="${EASY_VPN_VERSION_URL:-$(easy_vpn_project_raw_url VERSION)}"
 
     command_exists curl || { echo -e "${RED}[错误]${PLAIN} 未找到 curl，无法检查协议更新。"; return 1; }
     command_exists jq || { echo -e "${RED}[错误]${PLAIN} 未找到 jq，无法安全解析协议更新清单。"; return 1; }
 
     tmp=$(make_temp_dir protocol-catalog) || { echo -e "${RED}[错误]${PLAIN} 无法创建协议更新检查临时目录，请检查磁盘空间。" >&2; return 1; }
-    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --connect-timeout 5 --max-time 15 --retry 2 -o "${tmp}/remote.json" "$PROTOCOL_CATALOG_URL"; then
+    if ! fetch_easy_vpn_project_file "$PROTOCOL_CATALOG_URL" "$(easy_vpn_project_direct_raw_url protocol_catalog.json)" "${tmp}/remote.json"; then
         rm -rf "$tmp"
         echo -e "${RED}[错误]${PLAIN} 无法取得远端协议更新清单。"
         return 1
     fi
 
     if ! protocol_catalog_is_valid "${tmp}/remote.json"; then
-        rm -rf "$tmp"
-        echo -e "${RED}[错误]${PLAIN} 远端协议更新清单格式无效，已拒绝使用。"
-        return 1
+        if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" && -z "${EASY_VPN_PROTOCOL_CATALOG_URL:-}" ]]; then
+            rm -f -- "${tmp}/remote.json"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                --connect-timeout 5 --max-time 15 --retry 1 -o "${tmp}/remote.json" \
+                "$(easy_vpn_project_direct_raw_url protocol_catalog.json)" || true
+        fi
+        if ! protocol_catalog_is_valid "${tmp}/remote.json"; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误]${PLAIN} 远端协议清单格式无效，已拒绝使用。"
+            return 1
+        fi
     fi
 
-    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --connect-timeout 5 --max-time 15 --retry 2 -o "${tmp}/remote-version" "$version_url"; then
+    if ! fetch_easy_vpn_project_file "$version_url" "$(easy_vpn_project_direct_raw_url VERSION)" "${tmp}/remote-version"; then
         rm -rf -- "$tmp"
         echo -e "${RED}[错误]${PLAIN} 无法取得远端 Easy VPN 版本号，已停止更新检查。"
         return 1
@@ -2707,6 +2803,13 @@ protocol_update_check() {
         return 1
     fi
     remote_tool="$(tr -d '[:space:]' < "${tmp}/remote-version")"
+    if [[ ! "$remote_tool" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" && -z "${EASY_VPN_VERSION_URL:-}" ]]; then
+        rm -f -- "${tmp}/remote-version"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 5 --max-time 15 --retry 1 -o "${tmp}/remote-version" \
+            "$(easy_vpn_project_direct_raw_url VERSION)" || true
+        remote_tool="$(tr -d '[:space:]' < "${tmp}/remote-version" 2>/dev/null || true)"
+    fi
     if [[ ! "$remote_tool" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         rm -rf -- "$tmp"
         echo -e "${RED}[错误]${PLAIN} 远端 Easy VPN 版本号无效：${remote_tool}"
@@ -2924,6 +3027,7 @@ show_easy_vpn_summary() {
     echo -e "根分区：总容量 $(protocol_human_size "$disk_total_mib")  |  可用 $(protocol_human_size "$disk_available_mib")"
     echo -e "运行时间：${uptime_text}"
     echo -e "${BLUE}本工具专注于协议搭建：VLESS + Reality、Hysteria 2、TUIC v5；资源数值仅作部署前参考。${PLAIN}"
+    echo -e "${GREEN}快捷启动：下次打开终端输入 VPN（或 vpn）即可再次打开本菜单。${PLAIN}"
 }
 
 uninstall_protocol_environment() {
@@ -3113,7 +3217,7 @@ protocol_menu() {
         echo -e "  ${YELLOW}6. 检查更新（程序 / 协议 / 内核）${PLAIN}"
         echo -e "  ${YELLOW}7. 节点工具与诊断（二维码 / Clash 配置 / 端口跳跃）${PLAIN}"
         echo -e "  ${CYAN}----------------------------------------------------${PLAIN}"
-        echo -e "  ${RED}0. 退出${PLAIN}"
+        echo -e "  ${RED}0. 退出${PLAIN} ${GREEN}（下次可输入 VPN 快捷打开）${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
         read -rp "请选择 [0-7]: " choice || return 0
         case "$choice" in
