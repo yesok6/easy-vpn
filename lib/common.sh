@@ -317,12 +317,80 @@ make_temp_dir() {
 }
 
 download_https() {
-    local url="$1"
-    local output="$2"
-    curl --fail --silent --show-error --location \
-        --proto '=https' --tlsv1.2 \
-        --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 120 \
-        --output "$output" "$url"
+    local url="${1:-}"
+    local output="${2:-}"
+    local part="" rc=0 attempt=1 max_attempts=3 resume_supported=1
+    local -a curl_args=()
+
+    [[ -n "$url" && -n "$output" ]] || {
+        echo -e "${RED}[错误]${PLAIN} HTTPS 下载缺少 URL 或输出路径。" >&2
+        return 2
+    }
+    [[ ! -d "$output" ]] || {
+        echo -e "${RED}[错误]${PLAIN} HTTPS 下载目标是目录：${output}" >&2
+        return 1
+    }
+
+    # Download into a private temporary file in the destination directory.
+    # The final path is replaced only after curl confirms a complete response,
+    # so a timeout cannot leave a truncated archive/script at the expected path.
+    part=$(mktemp -- "${output}.part.XXXXXX") || {
+        echo -e "${RED}[错误]${PLAIN} 无法创建 HTTPS 下载临时文件：${output}" >&2
+        return 1
+    }
+    chmod 600 -- "$part" || { rm -f -- "$part"; return 1; }
+
+    while (( attempt <= max_attempts )); do
+        curl_args=(
+            --fail --silent --show-error --location
+            --proto '=https' --tlsv1.2
+            --connect-timeout 15 --max-time 600
+            --speed-limit 1024 --speed-time 120
+            --output "$part"
+        )
+        # Resume from the already downloaded byte count after an interrupted
+        # attempt. If the server rejects HTTP Range (curl exit 33), retry once
+        # from byte zero instead of concatenating incompatible responses.
+        if (( resume_supported )); then
+            curl_args+=(--continue-at -)
+        fi
+
+        if curl "${curl_args[@]}" "$url"; then
+            if [[ ! -s "$part" ]]; then
+                echo -e "${RED}[错误]${PLAIN} 下载结果为空，拒绝保存：${url}" >&2
+                rm -f -- "$part"
+                return 1
+            fi
+            if ! mv -f -- "$part" "$output"; then
+                echo -e "${RED}[错误]${PLAIN} 无法将下载文件保存到：${output}" >&2
+                rm -f -- "$part"
+                return 1
+            fi
+            return 0
+        else
+            rc=$?
+        fi
+
+        if (( rc == 33 && resume_supported )); then
+            echo -e "${YELLOW}[提示]${PLAIN} 下载源不支持断点续传，将清空临时数据并尝试完整下载。" >&2
+            resume_supported=0
+            : > "$part" || { rm -f -- "$part"; return 1; }
+        fi
+
+        if (( attempt < max_attempts )); then
+            if (( resume_supported )); then
+                echo -e "${YELLOW}[提示]${PLAIN} 下载中断（curl 错误码 ${rc}），将从已接收的数据继续（${attempt}/${max_attempts}）。" >&2
+            else
+                echo -e "${YELLOW}[提示]${PLAIN} 下载失败（curl 错误码 ${rc}），将重新尝试完整下载（${attempt}/${max_attempts}）。" >&2
+            fi
+            sleep 2
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    rm -f -- "$part"
+    echo -e "${RED}[错误]${PLAIN} HTTPS 下载在 ${max_attempts} 次尝试后仍失败（curl 错误码 ${rc}）。" >&2
+    return 1
 }
 
 download_shell_checked() {
