@@ -556,10 +556,32 @@ sni_candidate_domain_allowed() {
     return 0
 }
 
+# curl reports phase timestamps relative to command start. Subtract the
+# cumulative timestamps so DNS, TCP and TLS are not incorrectly merged into a
+# value labelled as "TLS handshake latency".
+sni_timing_components() {
+    local dns_elapsed="${1:-}" connect_elapsed="${2:-}" appconnect_elapsed="${3:-}"
+    [[ "$dns_elapsed" =~ ^[0-9]+([.][0-9]+)?$ &&
+       "$connect_elapsed" =~ ^[0-9]+([.][0-9]+)?$ &&
+       "$appconnect_elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    awk -v dns="$dns_elapsed" -v tcp="$connect_elapsed" -v tls="$appconnect_elapsed" '
+        BEGIN {
+            if (dns < 0 || tcp < dns || tls < tcp) exit 1
+            dns_ms = int(dns * 1000 + 0.5)
+            tcp_ms = int((tcp - dns) * 1000 + 0.5)
+            tls_ms = int((tls - tcp) * 1000 + 0.5)
+            setup_ms = int((tls - dns) * 1000 + 0.5)
+            printf "%d\t%d\t%d\t%d\n", dns_ms, tcp_ms, tls_ms, setup_ms
+        }
+    '
+}
+
 sni_probe_domain() {
-    local domain="$1" output_file="$2" curl_http2="${3:-1}" attempt probe_output elapsed http_version http_code redirects effective_url effective_host elapsed_ms last_reason="TLS/证书连接失败" cross_host=0 h2_output
+    local domain="$1" output_file="$2" curl_http2="${3:-1}"
+    local attempt probe_output dns_elapsed connect_elapsed appconnect_elapsed http_version http_code redirects effective_url effective_host dns_ms tcp_ms tls_ms setup_ms timing_row last_reason="TLS/证书连接失败" cross_host=0 h2_output
     local success_count=0
-    local -a latency_samples=() sorted_samples=() curl_http2_args=()
+    local -a dns_samples=() tcp_samples=() tls_samples=() setup_samples=()
+    local -a sorted_dns=() sorted_tcp=() sorted_tls=() sorted_setup=() curl_http2_args=()
 
     if [[ "$curl_http2" == 1 ]]; then
         curl_http2_args=(--http2)
@@ -578,18 +600,18 @@ sni_probe_domain() {
     fi
 
     for attempt in 1 2 3; do
-        # Use the host's normal certificate validation; require TLS 1.3 and
-        # negotiate HTTP/2. Follow only a few redirects so we can detect when a
-        # candidate's HTTPS entry point hands off to another hostname.
+        # curl timing fields are cumulative timestamps: time_appconnect includes
+        # DNS + TCP + TLS. Record all phases separately instead of mislabelling
+        # the cumulative value as the TLS handshake duration.
         if ! probe_output=$(curl --silent --show-error --location --max-redirs 4 \
             "${curl_http2_args[@]}" --tlsv1.3 --connect-timeout 2 --max-time 5 \
             --output /dev/null \
-            --write-out $'%{time_appconnect}\t%{http_version}\t%{http_code}\t%{num_redirects}\t%{url_effective}' \
+            --write-out $'%{time_namelookup}\t%{time_connect}\t%{time_appconnect}\t%{http_version}\t%{http_code}\t%{num_redirects}\t%{url_effective}' \
             "https://${domain}/" 2>/dev/null); then
             last_reason="连接超时、证书校验或 TLS 握手失败"
             continue
         fi
-        IFS=$'\t' read -r elapsed http_version http_code redirects effective_url <<< "$probe_output"
+        IFS=$'\t' read -r dns_elapsed connect_elapsed appconnect_elapsed http_version http_code redirects effective_url <<< "$probe_output"
         effective_host="${effective_url#*://}"
         effective_host="${effective_host%%/*}"
         effective_host="${effective_host%%:*}"
@@ -607,12 +629,15 @@ sni_probe_domain() {
             last_reason="HTTPS 页面状态不是 2xx（${http_code:-未知}）"
             continue
         fi
-        if [[ ! "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v n="$elapsed" 'BEGIN { exit !(n > 0) }'; then
-            last_reason="无法测量 TLS 握手耗时"
+        if ! timing_row=$(sni_timing_components "$dns_elapsed" "$connect_elapsed" "$appconnect_elapsed"); then
+            last_reason="无法分离 DNS、TCP 和 TLS 耗时"
             continue
         fi
-        elapsed_ms=$(awk -v n="$elapsed" 'BEGIN { printf "%.0f", n * 1000 }')
-        latency_samples+=("$elapsed_ms")
+        IFS=$'\t' read -r dns_ms tcp_ms tls_ms setup_ms <<< "$timing_row"
+        dns_samples+=("$dns_ms")
+        tcp_samples+=("$tcp_ms")
+        tls_samples+=("$tls_ms")
+        setup_samples+=("$setup_ms")
         success_count=$((success_count + 1))
     done
 
@@ -625,20 +650,30 @@ sni_probe_domain() {
         return 1
     fi
 
-    mapfile -t sorted_samples < <(printf '%s\n' "${latency_samples[@]}" | sort -n)
-    local median_ms
+    mapfile -t sorted_dns < <(printf '%s\n' "${dns_samples[@]}" | sort -n)
+    mapfile -t sorted_tcp < <(printf '%s\n' "${tcp_samples[@]}" | sort -n)
+    mapfile -t sorted_tls < <(printf '%s\n' "${tls_samples[@]}" | sort -n)
+    mapfile -t sorted_setup < <(printf '%s\n' "${setup_samples[@]}" | sort -n)
+    local median_dns median_tcp median_tls median_setup
     if (( success_count == 3 )); then
-        median_ms="${sorted_samples[1]}"
+        median_dns="${sorted_dns[1]}"
+        median_tcp="${sorted_tcp[1]}"
+        median_tls="${sorted_tls[1]}"
+        median_setup="${sorted_setup[1]}"
     else
-        median_ms=$(((sorted_samples[0] + sorted_samples[1]) / 2))
+        median_dns=$(((sorted_dns[0] + sorted_dns[1]) / 2))
+        median_tcp=$(((sorted_tcp[0] + sorted_tcp[1]) / 2))
+        median_tls=$(((sorted_tls[0] + sorted_tls[1]) / 2))
+        median_setup=$(((sorted_setup[0] + sorted_setup[1]) / 2))
     fi
-    printf '%s\t%s\t%s\n' "$domain" "$median_ms" "$success_count" > "$output_file"
+    # Columns: domain, TCP+TLS after DNS, DNS, TCP, TLS, successful attempts.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$domain" "$median_setup" "$median_dns" "$median_tcp" "$median_tls" "$success_count" > "$output_file"
 }
 
 get_best_sni() {
     local mode="${1:---interactive}" candidates=(www.apple.com www.icloud.com addons.mozilla.org www.mozilla.org www.microsoft.com www.adobe.com www.intel.com www.samsung.com)
-    local domain tmp result_file ranked_file best_domain best_latency best_count count=0 choice idx selected ui_fd=2 tty_open=0
-    local row row_domain row_latency row_count excluded=0
+    local domain tmp result_file ranked_file best_domain best_latency best_dns best_tcp best_tls best_count count=0 choice idx selected ui_fd=2 tty_open=0
+    local row row_domain row_latency row_dns row_tcp row_tls row_count excluded=0 launched=0 max_parallel=2
 
     if [[ "$mode" != "--auto" && -r /dev/tty && -w /dev/tty ]]; then
         exec 3<>/dev/tty || mode="--auto"
@@ -665,7 +700,7 @@ get_best_sni() {
         result_file="${tmp}/candidates.tsv"
         ranked_file="${tmp}/ranked.tsv"
         : > "$result_file"
-        printf '\n[Reality SNI] 正在扫描候选域名；每个域名测试 3 次……\n' >&"$ui_fd"
+        printf '\n[Reality SNI] 正在扫描候选域名；每个域名测试 3 次，每批最多测试 2 个域名，避免低配 VPS 上的并发负载影响测量……\n' >&"$ui_fd"
         for domain in "${candidates[@]}"; do
             if ! sni_candidate_domain_allowed "$domain"; then
                 excluded=$((excluded + 1))
@@ -674,16 +709,22 @@ get_best_sni() {
             (
                 sni_probe_domain "$domain" "${tmp}/${domain}.result" "$curl_http2" || true
             ) &
+            launched=$((launched + 1))
+            if (( launched >= max_parallel )); then
+                wait || true
+                launched=0
+            fi
         done
-        wait || true
+        (( launched == 0 )) || wait || true
 
         for domain in "${candidates[@]}"; do
             [[ -f "${tmp}/${domain}.result" ]] || continue
             cat -- "${tmp}/${domain}.result" >> "$result_file"
         done
         if [[ -s "$result_file" ]]; then
-            # Prefer stability first (3/3 beats 2/3), then the median TLS handshake time.
-            sort -t $'\t' -k3,3nr -k2,2n "$result_file" > "$ranked_file"
+            # Prefer stability first (3/3 beats 2/3), then TCP+TLS connection setup
+            # time after DNS. Do not rank by DNS lookup time or cumulative appconnect.
+            sort -t $'\t' -k6,6nr -k2,2n "$result_file" > "$ranked_file"
         else
             : > "$ranked_file"
         fi
@@ -706,18 +747,18 @@ get_best_sni() {
         fi
 
         printf '[过滤规则] 排除保留/示例域名、IP 字面量和本地域名；要求 TLS 1.3、证书校验通过、HTTP/2、HTTP 2xx、无跨域跳转，3 次测试至少成功 2 次。\n' >&"$ui_fd"
-        printf '\n序号  候选域名                      TLS 握手中位延迟   稳定性\n' >&"$ui_fd"
-        printf '%s\n' '----------------------------------------------------------------' >&"$ui_fd"
+        printf '\n序号  候选域名                    DNS    TCP    TLS   TCP+TLS  稳定性\n' >&"$ui_fd"
+        printf '%s\n' '------------------------------------------------------------------------' >&"$ui_fd"
         idx=0
-        while IFS=$'\t' read -r row_domain row_latency row_count; do
+        while IFS=$'\t' read -r row_domain row_latency row_dns row_tcp row_tls row_count; do
             [[ -n "$row_domain" ]] || continue
             idx=$((idx + 1))
-            printf ' %2d   %-29s %6s ms          %s/3\n' "$idx" "$row_domain" "$row_latency" "$row_count" >&"$ui_fd"
+            printf ' %2d   %-26s %4s ms %4s ms %4s ms %6s ms   %s/3\n' "$idx" "$row_domain" "$row_dns" "$row_tcp" "$row_tls" "$row_latency" "$row_count" >&"$ui_fd"
         done < "$ranked_file"
-        IFS=$'\t' read -r best_domain best_latency best_count < "$ranked_file"
+        IFS=$'\t' read -r best_domain best_latency best_dns best_tcp best_tls best_count < "$ranked_file"
 
         if [[ "$mode" == "--auto" ]]; then
-            printf '[自动选择] %s（TLS 握手中位延迟 %s ms，稳定性 %s/3）。\n' "$best_domain" "$best_latency" "$best_count" >&"$ui_fd"
+            printf '[自动选择] %s（DNS %s ms，TCP %s ms，TLS %s ms；TCP+TLS %s ms，稳定性 %s/3）。\n' "$best_domain" "$best_dns" "$best_tcp" "$best_tls" "$best_latency" "$best_count" >&"$ui_fd"
             printf '%s\n' "$best_domain"
             rm -rf -- "$tmp"
             (( tty_open )) && exec 3>&-
@@ -729,7 +770,7 @@ get_best_sni() {
         case "${choice,,}" in
             0)
                 selected="$best_domain"
-                printf '[已选择] 自动选择 %s（%s ms，中位延迟；稳定性 %s/3）。\n' "$best_domain" "$best_latency" "$best_count" >&"$ui_fd"
+                printf '[已选择] 自动选择 %s（TCP+TLS %s ms；DNS %s ms，TCP %s ms，TLS %s ms；稳定性 %s/3）。\n' "$best_domain" "$best_latency" "$best_dns" "$best_tcp" "$best_tls" "$best_count" >&"$ui_fd"
                 ;;
             r)
                 rm -rf -- "$tmp"
@@ -754,7 +795,7 @@ get_best_sni() {
                 fi
                 idx=0
                 selected=""
-                while IFS=$'\t' read -r row_domain row_latency row_count; do
+                while IFS=$'\t' read -r row_domain row_latency row_dns row_tcp row_tls row_count; do
                     idx=$((idx + 1))
                     if (( idx == 10#$choice )); then selected="$row_domain"; break; fi
                 done < "$ranked_file"
