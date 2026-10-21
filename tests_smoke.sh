@@ -32,6 +32,7 @@ for module in security apps optimize ip_test; do
     [[ ! -e "$ROOT/modules/${module}.sh" ]] || fail "unrelated module included: ${module}.sh"
 done
 ! grep -q 'VPS 综合运维与网络代理工具箱' "$ROOT/install.sh" || fail "generic toolbox menu must not exist"
+grep -q '当前系统没有 sudo' "$ROOT/install.sh" || fail "root-friendly missing-sudo error message missing"
 grep -q '^protocol_menu()' "$ROOT/modules/protocol.sh" || fail "protocol menu missing"
 grep -q '^show_easy_vpn_summary()' "$ROOT/modules/protocol.sh" || fail "resource summary missing"
 grep -q 'MemTotal:' "$ROOT/modules/protocol.sh" || fail "total memory probe missing"
@@ -40,7 +41,8 @@ grep -q 'df -Pm /' "$ROOT/modules/protocol.sh" || fail "root filesystem probe mi
 grep -q 'raw.githubusercontent.com/%s/%s/%s' "$ROOT/install.sh" || fail "branch URL helper missing"
 grep -Fq 'https://gh-proxy.org/%s' "$ROOT/install.sh" || fail "domestic GitHub acceleration URL helper missing"
 grep -Fq 'EASY_VPN_GITHUB_SOURCE_MODE=china' "$ROOT/README.md" || fail "README domestic one-click install missing"
-grep -Fq 'curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash' "$ROOT/README.md" || fail "README official one-click install missing"
+grep -Fq 'curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | bash' "$ROOT/README.md" || fail "README root one-click install missing"
+grep -Fq 'curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash' "$ROOT/README.md" || fail "README non-root sudo install missing"
 ! grep -Eq '你的用户名|你的仓库|EASY_VPN_GITHUB_USER=|EASY_VPN_GITHUB_REPO=' "$ROOT/README.md" || fail "README still asks users to configure repository owner/name"
 grep -q 'EASY_VPN_SHORTCUT:-/usr/local/bin/vpn' "$ROOT/install.sh" || fail "vpn shortcut default missing"
 grep -Fq 'EASY_VPN_UPPERCASE_SHORTCUT:-${SHORTCUT%/*}/VPN' "$ROOT/install.sh" || fail "uppercase VPN shortcut missing"
@@ -188,6 +190,10 @@ LOG_DIR="${regression_test}/mode-conf" bash -c '
 # A failed GH-Proxy bundle request must fall back to the official Raw URL.
 download_functions="${regression_test}/download-functions.sh"
 sed -n '/^download_bundle_file()/,/^}/p' "$ROOT/install.sh" > "$download_functions"
+[[ -s "$download_functions" ]] || fail "download_bundle_file function extraction failed"
+grep -Fq -- '--max-time 600' "$download_functions" || fail "bootstrap bundle download timeout remains too short"
+grep -Fq -- '--continue-at -' "$download_functions" || fail "bootstrap bundle download resume is missing"
+grep -Fq -- '--speed-limit 1024 --speed-time 120' "$download_functions" || fail "bootstrap download low-speed guard missing"
 mkdir -p "${regression_test}/download-mockbin"
 cat > "${regression_test}/download-mockbin/curl" <<'MOCK_ACCEL_CURL'
 #!/usr/bin/env bash
@@ -886,9 +892,12 @@ esac
 MOCK_CURL
 chmod 755 "$update_test/mockbin/curl" "$update_test/mockbin/sing-box"
 cp "$update_test/same/protocol_catalog.json" "$update_test/new/protocol_catalog.json"
-jq --arg version '1.0.20' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
+IFS=. read -r update_major update_minor update_patch < "$ROOT/VERSION"
+update_patch=$((update_patch + 1))
+update_fixture_version="${update_major}.${update_minor}.${update_patch}"
+jq --arg version "$update_fixture_version" '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
 mv "$update_test/new/catalog.tmp" "$update_test/new/protocol_catalog.json"
-printf '1.0.20\n' > "$update_test/new/VERSION"
+printf '%s\n' "$update_fixture_version" > "$update_test/new/VERSION"
 no_update_output=$(printf '0\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/same" \
     EASY_VPN_ROOT="$ROOT" EASY_VPN_ETC="$update_test/etc" EASY_VPN_STATE="$update_test/state" \
     EASY_VPN_BACKUPS="$update_test/backups" EASY_VPN_LOG="$update_test/log" \
@@ -1043,19 +1052,23 @@ bash -c '
   if sni_candidate_domain_allowed example.com; then exit 108; fi
   if sni_candidate_domain_allowed 127.0.0.1; then exit 109; fi
   if sni_candidate_domain_allowed local.test; then exit 110; fi
+  timing=$(sni_timing_components 0.040 0.080 0.110) || exit 116
+  [[ "$timing" == "$(printf "40\t40\t30\t70")" ]] || exit 117
+  if sni_timing_components 0.080 0.040 0.110 >/dev/null 2>&1; then exit 118; fi
   sni_probe_domain() {
     case "$1" in
-      www.apple.com) printf "%s\\t%s\\t%s\\n" "$1" 90 3 > "$2" ;;
-      addons.mozilla.org) printf "%s\\t%s\\t%s\\n" "$1" 70 3 > "$2" ;;
-      www.icloud.com) printf "%s\\t%s\\t%s\\n" "$1" 10 2 > "$2" ;;
+      www.apple.com) printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$1" 90 10 40 50 3 > "$2" ;;
+      addons.mozilla.org) printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$1" 70 5 25 40 3 > "$2" ;;
+      www.icloud.com) printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$1" 10 1 2 8 2 > "$2" ;;
       *) return 1 ;;
     esac
   }
   selected=$(get_best_sni --auto 2>"$EASY_VPN_ROOT/sni-test.log") || exit 111
   [[ "$selected" == "addons.mozilla.org" ]] || exit 112
   grep -Fq "Prefer stability first" "$1/modules/protocol.sh" || exit 113
-  ! grep -Fq "回车使用自动建议" "$1/modules/protocol.sh" || exit 114
-  grep -Fq "输入序号选择域名；输入 0 自动选择综合最佳项" "$1/modules/protocol.sh" || exit 115
+  grep -Fq "time_appconnect includes" "$1/modules/protocol.sh" || exit 114
+  ! grep -Fq "回车使用自动建议" "$1/modules/protocol.sh" || exit 115
+  grep -Fq "输入序号选择域名；输入 0 自动选择综合最佳项" "$1/modules/protocol.sh" || exit 119
 ' _ "$ROOT" || fail "SNI filtering/selection regression"
 
 # 12. Protocol inbounds use an IPv4 wildcard when IPv6 is explicitly disabled.
