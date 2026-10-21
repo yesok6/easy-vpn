@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-CURRENT_VERSION="1.0.17"
+CURRENT_VERSION="1.0.19"
 # This project has a fixed public repository; users do not need to configure owner/repo.
 GITHUB_USER="yesok6"
 GITHUB_REPO="easy-vpn"
