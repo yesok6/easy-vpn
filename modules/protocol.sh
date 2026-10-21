@@ -540,32 +540,232 @@ protocol_listen_address() {
     fi
 }
 
-get_best_sni() {
-    local candidates=(gateway.icloud.com itunes.apple.com addons.mozilla.org swdist.apple.com www.microsoft.com images.unsplash.com)
-    local tmp domain elapsed best="" result_file
-    tmp=$(make_temp_dir sni) || { echo "addons.mozilla.org"; return 0; }
-    for domain in "${candidates[@]}"; do
-        (
-            # Reality relies on TLS 1.3. Test the TLS handshake itself rather than
-            # selecting a host based only on TCP connect latency. Each worker writes
-            # a private result file to avoid concurrent append/parse races.
-            elapsed=$(curl --tlsv1.3 -o /dev/null -sS -w '%{time_appconnect}' --connect-timeout 2 --max-time 4 "https://${domain}" 2>/dev/null || true)
-            [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ && "$elapsed" != 0 && "$elapsed" != 0.000000 ]] || exit 0
-            printf '%s %s\n' "$elapsed" "$domain" > "${tmp}/${domain}.result"
-        ) &
-    done
-    wait
-    if compgen -G "${tmp}/*.result" >/dev/null; then
-        best=$(cat "${tmp}"/*.result | sort -n | head -n1 | awk '{print $2}')
-    fi
-    rm -rf -- "$tmp"
-    if [[ -n "$best" ]]; then
-        printf '%s\n' "$best"
+sni_candidate_domain_allowed() {
+    local host="${1,,}"
+    validate_sni_hostname "$host" || return 1
+    # Reject IP literals and reserved/private naming patterns even though the
+    # current candidate list is curated. This protects future list additions.
+    [[ ! "$host" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    case "$host" in
+        example|*.example|example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|\
+        invalid|*.invalid|test|*.test|localhost|*.localhost|local|*.local|\
+        internal|*.internal|lan|*.lan|home.arpa|*.home.arpa)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+sni_probe_domain() {
+    local domain="$1" output_file="$2" curl_http2="${3:-1}" attempt probe_output elapsed http_version http_code redirects effective_url effective_host elapsed_ms last_reason="TLS/证书连接失败" cross_host=0 h2_output
+    local success_count=0
+    local -a latency_samples=() sorted_samples=() curl_http2_args=()
+
+    if [[ "$curl_http2" == 1 ]]; then
+        curl_http2_args=(--http2)
     else
-        echo -e "${YELLOW}[提示]${PLAIN} 所有候选站点均未通过 TLS 1.3 握手测试，回退到 addons.mozilla.org；请根据客户端网络情况确认可达性。" >&2
-        log_action "[提示] 所有候选站点均未通过 TLS 1.3 握手测试，回退到 addons.mozilla.org"
-        printf 'addons.mozilla.org\n'
+        # Older curl builds may lack nghttp2 support. Verify ALPN h2 with
+        # OpenSSL, while curl still checks the HTTPS certificate and response.
+        if ! h2_output=$(timeout 6 openssl s_client -connect "${domain}:443" -servername "$domain" \
+            -tls1_3 -alpn h2 </dev/null 2>&1); then
+            printf '%s\n' "TLS 1.3/HTTP2 握手失败" > "${output_file}.reason"
+            return 1
+        fi
+        if ! grep -Fq 'ALPN protocol: h2' <<< "$h2_output"; then
+            printf '%s\n' "未协商到 HTTP/2" > "${output_file}.reason"
+            return 1
+        fi
     fi
+
+    for attempt in 1 2 3; do
+        # Use the host's normal certificate validation; require TLS 1.3 and
+        # negotiate HTTP/2. Follow only a few redirects so we can detect when a
+        # candidate's HTTPS entry point hands off to another hostname.
+        if ! probe_output=$(curl --silent --show-error --location --max-redirs 4 \
+            "${curl_http2_args[@]}" --tlsv1.3 --connect-timeout 2 --max-time 5 \
+            --output /dev/null \
+            --write-out $'%{time_appconnect}\t%{http_version}\t%{http_code}\t%{num_redirects}\t%{url_effective}' \
+            "https://${domain}/" 2>/dev/null); then
+            last_reason="连接超时、证书校验或 TLS 握手失败"
+            continue
+        fi
+        IFS=$'\t' read -r elapsed http_version http_code redirects effective_url <<< "$probe_output"
+        effective_host="${effective_url#*://}"
+        effective_host="${effective_host%%/*}"
+        effective_host="${effective_host%%:*}"
+        effective_host="${effective_host,,}"
+        if [[ -n "$effective_host" && "$effective_host" != "$domain" ]]; then
+            cross_host=1
+            last_reason="跳转到其他域名"
+            continue
+        fi
+        if [[ "$curl_http2" == 1 && ! "$http_version" =~ ^2(\.0)?$ ]]; then
+            last_reason="未协商到 HTTP/2"
+            continue
+        fi
+        if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            last_reason="HTTPS 页面状态不是 2xx（${http_code:-未知}）"
+            continue
+        fi
+        if [[ ! "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v n="$elapsed" 'BEGIN { exit !(n > 0) }'; then
+            last_reason="无法测量 TLS 握手耗时"
+            continue
+        fi
+        elapsed_ms=$(awk -v n="$elapsed" 'BEGIN { printf "%.0f", n * 1000 }')
+        latency_samples+=("$elapsed_ms")
+        success_count=$((success_count + 1))
+    done
+
+    if (( cross_host )); then
+        printf '%s\n' "$last_reason" > "${output_file}.reason"
+        return 1
+    fi
+    if (( success_count < 2 )); then
+        printf '%s\n' "$last_reason" > "${output_file}.reason"
+        return 1
+    fi
+
+    mapfile -t sorted_samples < <(printf '%s\n' "${latency_samples[@]}" | sort -n)
+    local median_ms
+    if (( success_count == 3 )); then
+        median_ms="${sorted_samples[1]}"
+    else
+        median_ms=$(((sorted_samples[0] + sorted_samples[1]) / 2))
+    fi
+    printf '%s\t%s\t%s\n' "$domain" "$median_ms" "$success_count" > "$output_file"
+}
+
+get_best_sni() {
+    local mode="${1:---interactive}" candidates=(www.apple.com www.icloud.com addons.mozilla.org www.mozilla.org www.microsoft.com www.adobe.com www.intel.com www.samsung.com)
+    local domain tmp result_file ranked_file best_domain best_latency best_count count=0 choice idx selected ui_fd=2 tty_open=0
+    local row row_domain row_latency row_count excluded=0
+
+    if [[ "$mode" != "--auto" && -r /dev/tty && -w /dev/tty ]]; then
+        exec 3<>/dev/tty || mode="--auto"
+        if [[ "$mode" != "--auto" ]]; then ui_fd=3; tty_open=1; fi
+    else
+        mode="--auto"
+    fi
+
+    local curl_http2=0
+    if curl --version 2>/dev/null | grep -Eq '(^|[[:space:]])HTTP2([[:space:]]|$)'; then
+        curl_http2=1
+    elif ! command -v openssl >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+        printf '[错误] 当前 curl 不支持 HTTP/2，且缺少 openssl/timeout，无法可靠筛选候选域名。\n' >&"$ui_fd"
+        (( tty_open )) && exec 3>&-
+        return 1
+    fi
+
+    while :; do
+        tmp=$(make_temp_dir sni) || {
+            printf '[错误] 无法创建 SNI 扫描临时目录。\n' >&"$ui_fd"
+            (( tty_open )) && exec 3>&-
+            return 1
+        }
+        result_file="${tmp}/candidates.tsv"
+        ranked_file="${tmp}/ranked.tsv"
+        : > "$result_file"
+        printf '\n[Reality SNI] 正在扫描候选域名；每个域名测试 3 次……\n' >&"$ui_fd"
+        for domain in "${candidates[@]}"; do
+            if ! sni_candidate_domain_allowed "$domain"; then
+                excluded=$((excluded + 1))
+                continue
+            fi
+            (
+                sni_probe_domain "$domain" "${tmp}/${domain}.result" "$curl_http2" || true
+            ) &
+        done
+        wait || true
+
+        for domain in "${candidates[@]}"; do
+            [[ -f "${tmp}/${domain}.result" ]] || continue
+            cat -- "${tmp}/${domain}.result" >> "$result_file"
+        done
+        if [[ -s "$result_file" ]]; then
+            # Prefer stability first (3/3 beats 2/3), then the median TLS handshake time.
+            sort -t $'\t' -k3,3nr -k2,2n "$result_file" > "$ranked_file"
+        else
+            : > "$ranked_file"
+        fi
+        count=$(awk 'END { print NR+0 }' "$ranked_file")
+
+        if (( count == 0 )); then
+            printf '[过滤结果] 没有候选域名同时满足 TLS 1.3、有效证书、HTTP/2、HTTP 2xx、无跨域跳转和稳定性要求。\n' >&"$ui_fd"
+            rm -rf -- "$tmp"
+            if [[ "$mode" == "--auto" ]]; then
+                printf '[错误] 没有通过筛选的 SNI，已取消部署；不会回退到未经验证的默认域名。\n' >&"$ui_fd"
+                (( tty_open )) && exec 3>&-
+                return 1
+            fi
+            printf '输入 R 重新扫描，输入 Q 取消部署：' >&"$ui_fd"
+            IFS= read -r choice <&3 || choice=Q
+            case "$choice" in
+                [Rr]) continue ;;
+                *) (( tty_open )) && exec 3>&-; return 1 ;;
+            esac
+        fi
+
+        printf '[过滤规则] 排除保留/示例域名、IP 字面量和本地域名；要求 TLS 1.3、证书校验通过、HTTP/2、HTTP 2xx、无跨域跳转，3 次测试至少成功 2 次。\n' >&"$ui_fd"
+        printf '\n序号  候选域名                      TLS 握手中位延迟   稳定性\n' >&"$ui_fd"
+        printf '%s\n' '----------------------------------------------------------------' >&"$ui_fd"
+        idx=0
+        while IFS=$'\t' read -r row_domain row_latency row_count; do
+            [[ -n "$row_domain" ]] || continue
+            idx=$((idx + 1))
+            printf ' %2d   %-29s %6s ms          %s/3\n' "$idx" "$row_domain" "$row_latency" "$row_count" >&"$ui_fd"
+        done < "$ranked_file"
+        IFS=$'\t' read -r best_domain best_latency best_count < "$ranked_file"
+
+        if [[ "$mode" == "--auto" ]]; then
+            printf '[自动选择] %s（TLS 握手中位延迟 %s ms，稳定性 %s/3）。\n' "$best_domain" "$best_latency" "$best_count" >&"$ui_fd"
+            printf '%s\n' "$best_domain"
+            rm -rf -- "$tmp"
+            (( tty_open )) && exec 3>&-
+            return 0
+        fi
+
+        printf '\n输入序号选择域名；输入 0 自动选择综合最佳项；输入 R 重新扫描；输入 Q 取消部署：' >&"$ui_fd"
+        IFS= read -r choice <&3 || choice=Q
+        case "${choice,,}" in
+            0)
+                selected="$best_domain"
+                printf '[已选择] 自动选择 %s（%s ms，中位延迟；稳定性 %s/3）。\n' "$best_domain" "$best_latency" "$best_count" >&"$ui_fd"
+                ;;
+            r)
+                rm -rf -- "$tmp"
+                continue
+                ;;
+            q)
+                rm -rf -- "$tmp"
+                printf '[取消] 用户取消 SNI 选择，未部署协议。\n' >&"$ui_fd"
+                (( tty_open )) && exec 3>&-
+                return 1
+                ;;
+            ''|*[!0-9]*)
+                printf '[提示] 输入无效，请输入表格中的序号、0、R 或 Q。\n' >&"$ui_fd"
+                rm -rf -- "$tmp"
+                continue
+                ;;
+            *)
+                if (( 10#$choice < 1 || 10#$choice > count )); then
+                    printf '[提示] 序号超出范围，请重新选择。\n' >&"$ui_fd"
+                    rm -rf -- "$tmp"
+                    continue
+                fi
+                idx=0
+                selected=""
+                while IFS=$'\t' read -r row_domain row_latency row_count; do
+                    idx=$((idx + 1))
+                    if (( idx == 10#$choice )); then selected="$row_domain"; break; fi
+                done < "$ranked_file"
+                printf '[已选择] %s。\n' "$selected" >&"$ui_fd"
+                ;;
+        esac
+        printf '%s\n' "$selected"
+        rm -rf -- "$tmp"
+        (( tty_open )) && exec 3>&-
+        return 0
+    done
 }
 
 protocol_fragment_file() {
@@ -2158,7 +2358,7 @@ deploy_vless_reality() {
     echo -e "${CYAN}              [VLESS + Reality]                    ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port sni uuid key_pair private_key public_key short_id server_ip uri_host vision_flow suggested_sni custom_sni
+    local default_port input_port port sni uuid key_pair private_key public_key short_id server_ip uri_host vision_flow sni_mode
     local pipeline_mode="${1:-}"
     local fragment rollback_dir had_fragment=0
     default_port=$(get_random_protocol_port tcp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 TCP 端口。"; return 1; }
@@ -2179,21 +2379,11 @@ deploy_vless_reality() {
         [[ "$vision_choice" =~ ^[Nn]$ ]] && vision_flow=""
     fi
 
-    suggested_sni=$(get_best_sni)
-    sni="$suggested_sni"
-    if [[ "$pipeline_mode" != "pipeline" && -z "${EASY_VPN_PIPELINE:-}" ]]; then
-        read -rp "Reality SNI [回车使用自动建议 ${suggested_sni}，或输入自定义域名]: " custom_sni || {
-            echo -e "${YELLOW}[取消]${PLAIN} 未读取到 SNI 输入。"
-            return 1
-        }
-        if [[ -n "${custom_sni//[[:space:]]/}" ]]; then
-            custom_sni="${custom_sni,,}"
-            if ! validate_sni_hostname "$custom_sni"; then
-                echo -e "${RED}[错误]${PLAIN} SNI 必须是合法的完整域名，例如 www.example.com。"
-                return 1
-            fi
-            sni="$custom_sni"
-        fi
+    sni_mode="--interactive"
+    [[ "$pipeline_mode" == "pipeline" || -n "${EASY_VPN_PIPELINE:-}" ]] && sni_mode="--auto"
+    if ! sni=$(get_best_sni "$sni_mode"); then
+        echo -e "${RED}[错误]${PLAIN} 未能选择通过筛选的 Reality SNI，已取消本次部署。"
+        return 1
     fi
 
     install_singbox || return 1
@@ -2291,7 +2481,7 @@ deploy_hysteria2() {
     echo -e "${CYAN}                [Hysteria 2]                       ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
 
-    local default_port input_port port password cert_file key_file server_ip uri_host sni="" hop_range="" cert_fp=""
+    local default_port input_port port password cert_file key_file server_ip uri_host sni="" hop_range="" cert_fp="" sni_mode
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，允许 80、443 或 1024-65535]: " input_port || { echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口输入。"; return 1; }
@@ -2306,6 +2496,13 @@ deploy_hysteria2() {
         hop_range=""
     fi
     check_protocol_resources hy2 || return 1
+
+    sni_mode="--interactive"
+    [[ -n "${EASY_VPN_PIPELINE:-}" ]] && sni_mode="--auto"
+    if ! sni=$(get_best_sni "$sni_mode"); then
+        echo -e "${RED}[错误]${PLAIN} 未能选择通过筛选的 Hysteria 2 SNI，已取消本次部署。"
+        return 1
+    fi
 
     install_singbox || return 1
     prepare_protocol_state
@@ -2326,14 +2523,6 @@ deploy_hysteria2() {
         unmark_owned "$cert_file"
         unmark_owned "$key_file"
     fi
-    # Use the same SNI in the client link and certificate subject, instead of
-    # the old hard-coded bing.com value shared by every deployment.
-    sni=$(get_best_sni)
-    [[ "$sni" =~ ^[A-Za-z0-9.-]+$ ]] || {
-        rm -rf -- "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} 自动选择的 Hysteria 2 SNI 无效。"
-        return 1
-    }
     if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$key_file" -out "$cert_file" -days 365 -subj "/CN=${sni}" -addext "subjectAltName=DNS:${sni}" -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
         rm -rf "$rollback_dir"
@@ -2457,7 +2646,7 @@ deploy_tuic_v5() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${BLUE}[说明]${PLAIN} 面向游戏/实时 UDP 场景，使用原生 UDP 中继；0-RTT 默认关闭以避免重放风险。"
 
-    local default_port input_port port password uuid cert_file key_file server_ip uri_host sni="" cert_fp=""
+    local default_port input_port port password uuid cert_file key_file server_ip uri_host sni="" cert_fp="" sni_mode
     local fragment rollback_dir had_fragment=0 fragment_json
     default_port=$(get_random_protocol_port udp) || { echo -e "${RED}[错误]${PLAIN} 无法找到空闲 UDP 端口。"; return 1; }
     read -rp "UDP 端口 [回车使用 ${default_port}，允许 80、443 或 1024-65535]: " input_port || { echo -e "${YELLOW}[取消]${PLAIN} 未读取到端口输入。"; return 1; }
@@ -2468,6 +2657,13 @@ deploy_tuic_v5() {
     # TUIC v5 clients do not provide a portable native multi-port hopping setting.
     # Port hopping remains available for Hysteria 2 only.
     check_protocol_resources tuic || return 1
+
+    sni_mode="--interactive"
+    [[ -n "${EASY_VPN_PIPELINE:-}" ]] && sni_mode="--auto"
+    if ! sni=$(get_best_sni "$sni_mode"); then
+        echo -e "${RED}[错误]${PLAIN} 未能选择通过筛选的 TUIC SNI，已取消本次部署。"
+        return 1
+    fi
 
     install_singbox || return 1
     prepare_protocol_state
@@ -2489,14 +2685,6 @@ deploy_tuic_v5() {
         unmark_owned "$cert_file"
         unmark_owned "$key_file"
     fi
-    # Match the certificate subject and share-link SNI to a tested candidate;
-    # don't reuse the same hard-coded CN and decade-long validity for every node.
-    sni=$(get_best_sni)
-    [[ "$sni" =~ ^[A-Za-z0-9.-]+$ ]] || {
-        rm -rf -- "$rollback_dir"
-        echo -e "${RED}[错误]${PLAIN} 自动选择的 TUIC SNI 无效。"
-        return 1
-    }
     if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$key_file" -out "$cert_file" -days 365 -subj "/CN=${sni}" -addext "subjectAltName=DNS:${sni}" -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
         rm -rf "$rollback_dir"
