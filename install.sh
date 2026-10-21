@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-CURRENT_VERSION="1.0.19"
+CURRENT_VERSION="1.0.22"
 # This project has a fixed public repository; users do not need to configure owner/repo.
 GITHUB_USER="yesok6"
 GITHUB_REPO="easy-vpn"
@@ -38,7 +38,14 @@ EASY_VPN_RELEASE_PUBKEY=''
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; PLAIN='\033[0m'
 
-[[ ${EUID} -eq 0 ]] || { echo -e "${RED}[错误]${PLAIN} 此操作需要 root 权限。请使用：sudo bash install.sh${PLAIN}"; exit 1; }
+if [[ ${EUID} -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        echo -e "${RED}[错误]${PLAIN} 此操作需要 root 权限。请使用 sudo bash install.sh，或先切换为 root 后执行 bash install.sh。" >&2
+    else
+        echo -e "${RED}[错误]${PLAIN} 此操作需要 root 权限；当前系统没有 sudo。请先切换为 root 用户，再执行 bash install.sh。" >&2
+    fi
+    exit 1
+fi
 for path in "$LOCAL_ROOT" "$LOCAL_MODULES" "$LOCAL_LIB" "$LOG_DIR"; do
     [[ ! -L "$path" ]] || { echo -e "${RED}[错误]${PLAIN} 安装路径不能是符号链接：${path}"; exit 1; }
 done
@@ -198,26 +205,87 @@ raw_base_url() {
 }
 
 download_bundle_file() {
-    local primary_base="$1" direct_base="$2" file="$3" output="$4" url
-    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
-        # Do not append query parameters to the proxy URL: keep its nested target URL intact.
-        url="${primary_base}/${file}"
-        if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"; then
-            return 0
-        fi
-        rm -f -- "$output"
-        echo -e "${YELLOW}[国内加速回退]${PLAIN} 加速源下载 ${file} 失败，改用 GitHub 官方源重试。" >&2
-        url="${direct_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}"
-        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"
-    else
-        url="${primary_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}"
-        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --connect-timeout 10 --max-time 120 --retry 2 -o "$output" "$url"
-    fi
-}
+    local primary_base="$1" direct_base="$2" file="$3" output="$4"
+    local url part rc attempt source_index resume_supported
+    local max_attempts=3
+    local -a urls=() curl_args=()
 
+    # Prefer the configured source, but retain the official Raw fallback in
+    # China mode. Keep this bootstrap downloader self-contained: it runs before
+    # lib/common.sh is available.
+    if [[ "${EASY_VPN_GITHUB_SOURCE_MODE:-direct}" == "china" ]]; then
+        # Do not append query parameters to a proxy URL: keep its nested target URL intact.
+        urls+=("${primary_base}/${file}")
+        urls+=("${direct_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}")
+    else
+        urls+=("${primary_base}/${file}?t=$(date +%s)-${RANDOM}${RANDOM}")
+    fi
+
+    part=$(mktemp -- "${output}.part.XXXXXX") || {
+        echo -e "${RED}[错误]${PLAIN} 无法创建下载临时文件：${output}" >&2
+        return 1
+    }
+    chmod 600 -- "$part" || { rm -f -- "$part"; return 1; }
+
+    for source_index in "${!urls[@]}"; do
+        url="${urls[$source_index]}"
+        attempt=1
+        resume_supported=1
+        : > "$part" || { rm -f -- "$part"; return 1; }
+
+        while (( attempt <= max_attempts )); do
+            curl_args=(
+                --fail --silent --show-error --location
+                --proto '=https' --tlsv1.2
+                --connect-timeout 15 --max-time 600
+                --speed-limit 1024 --speed-time 120
+                --output "$part"
+            )
+            if (( resume_supported )); then
+                curl_args+=(--continue-at -)
+            fi
+
+            if curl "${curl_args[@]}" "$url"; then
+                if [[ ! -s "$part" ]]; then
+                    echo -e "${YELLOW}[下载提示]${PLAIN} ${file} 下载结果为空，拒绝保存。" >&2
+                elif mv -f -- "$part" "$output"; then
+                    return 0
+                else
+                    echo -e "${RED}[错误]${PLAIN} 无法将下载文件保存到：${output}" >&2
+                    rm -f -- "$part"
+                    return 1
+                fi
+                rc=1
+            else
+                rc=$?
+            fi
+
+            if (( rc == 33 && resume_supported )); then
+                echo -e "${YELLOW}[下载提示]${PLAIN} ${file} 的下载源不支持断点续传，改为完整下载重试。" >&2
+                resume_supported=0
+                : > "$part" || { rm -f -- "$part"; return 1; }
+            fi
+
+            if (( attempt < max_attempts )); then
+                if (( resume_supported )); then
+                    echo -e "${YELLOW}[下载重试]${PLAIN} ${file} 下载中断（curl 错误码 ${rc}），将尝试续传（${attempt}/${max_attempts}）。" >&2
+                else
+                    echo -e "${YELLOW}[下载重试]${PLAIN} ${file} 下载失败（curl 错误码 ${rc}），将重新完整下载（${attempt}/${max_attempts}）。" >&2
+                fi
+                sleep 2
+            fi
+            attempt=$((attempt + 1))
+        done
+
+        if (( source_index + 1 < ${#urls[@]} )); then
+            echo -e "${YELLOW}[国内加速回退]${PLAIN} 加速源下载 ${file} 失败，改用 GitHub 官方源重试。" >&2
+        fi
+    done
+
+    rm -f -- "$part"
+    echo -e "${RED}[错误]${PLAIN} ${file} 下载失败；已清理不完整的临时文件。" >&2
+    return 1
+}
 # Compare stable numeric version components; this is used only to prevent accidental downgrades.
 easy_vpn_version_gt() {
     local a="$1" b="$2" a1 a2 a3 b1 b2 b3
