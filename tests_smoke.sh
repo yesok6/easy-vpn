@@ -62,6 +62,90 @@ grep -q '^firewall_open_port_entries()' "$ROOT/lib/common.sh" || fail "firewall_
 regression_test=$(mktemp -d /tmp/easy-vpn-regression.XXXXXX)
 trap 'rm -rf -- "${regression_test:-}"' EXIT
 
+# download_https: long timeout, HTTP Range resume, fallback if Range is unsupported,
+# and no partial file left behind after repeated failures.
+download_https_function="${regression_test}/download-https.sh"
+sed -n '/^download_https()/,/^}/p' "$ROOT/lib/common.sh" > "$download_https_function"
+[[ -s "$download_https_function" ]] || fail "download_https function extraction failed"
+mkdir -p "${regression_test}/download-https-bin"
+cat > "${regression_test}/download-https-bin/curl" <<'MOCK_DOWNLOAD_HTTPS_CURL'
+#!/usr/bin/env bash
+set -u
+out="" url="" resume=0 max_time="" connect_timeout="" speed_limit="" speed_time=""
+while (($#)); do
+    case "$1" in
+        --output|-o) out="${2:-}"; shift 2 ;;
+        --continue-at|-C) [[ "${2:-}" == "-" ]] || exit 90; resume=1; shift 2 ;;
+        --max-time) max_time="${2:-}"; shift 2 ;;
+        --connect-timeout) connect_timeout="${2:-}"; shift 2 ;;
+        --speed-limit) speed_limit="${2:-}"; shift 2 ;;
+        --speed-time) speed_time="${2:-}"; shift 2 ;;
+        --proto) shift 2 ;;
+        --fail|--silent|--show-error|--location|--tlsv1.2) shift ;;
+        https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+[[ -n "$out" && "$url" == https://mock.example/* ]] || { echo "bad mock curl args" >&2; exit 91; }
+[[ "$max_time" == 600 && "$connect_timeout" == 15 && "$speed_limit" == 1024 && "$speed_time" == 120 ]] || { echo "download timeout policy missing" >&2; exit 92; }
+state="${MOCK_CURL_STATE:?}"
+count=0; [[ ! -f "$state" ]] || count="$(cat "$state")"
+count=$((count + 1)); printf '%s' "$count" > "$state"
+case "${MOCK_CURL_MODE:-resume}" in
+    resume)
+        [[ "$resume" == 1 ]] || { echo "resume flag missing on retry" >&2; exit 93; }
+        if (( count == 1 )); then printf '%s' 'partial-' > "$out"; exit 28; fi
+        [[ "$(cat "$out")" == 'partial-' ]] || { echo "partial data was not retained for resume" >&2; exit 94; }
+        printf '%s' 'complete' >> "$out"
+        exit 0
+        ;;
+    range_unsupported)
+        if (( resume )); then exit 33; fi
+        printf '%s' 'complete-download' > "$out"
+        exit 0
+        ;;
+    fail)
+        printf '%s' 'partial-data' > "$out"
+        exit 28
+        ;;
+    *) exit 95 ;;
+esac
+MOCK_DOWNLOAD_HTTPS_CURL
+cat > "${regression_test}/download-https-bin/sleep" <<'MOCK_DOWNLOAD_SLEEP'
+#!/usr/bin/env bash
+exit 0
+MOCK_DOWNLOAD_SLEEP
+chmod 755 "${regression_test}/download-https-bin/curl" "${regression_test}/download-https-bin/sleep"
+
+resume_dest="${regression_test}/resume-output.bin"
+MOCK_CURL_MODE=resume MOCK_CURL_STATE="${regression_test}/resume-state" \
+    PATH="${regression_test}/download-https-bin:$PATH" \
+    bash -c 'RED=red; PLAIN=plain; source "$1"; download_https https://mock.example/asset "$2"' \
+    _ "$download_https_function" "$resume_dest" >/dev/null 2>&1 || fail "download_https resume retry failed"
+[[ "$(cat "$resume_dest")" == 'partial-complete' ]] || fail "download_https did not resume the partial transfer"
+[[ "$(cat "${regression_test}/resume-state")" == 2 ]] || fail "download_https resume retry count incorrect"
+
+range_dest="${regression_test}/range-fallback.bin"
+MOCK_CURL_MODE=range_unsupported MOCK_CURL_STATE="${regression_test}/range-state" \
+    PATH="${regression_test}/download-https-bin:$PATH" \
+    bash -c 'RED=red; PLAIN=plain; source "$1"; download_https https://mock.example/asset "$2"' \
+    _ "$download_https_function" "$range_dest" >/dev/null 2>&1 || fail "download_https full-download fallback failed when Range is unsupported"
+[[ "$(cat "$range_dest")" == 'complete-download' ]] || fail "download_https Range fallback content incorrect"
+[[ "$(cat "${regression_test}/range-state")" == 2 ]] || fail "download_https Range fallback did not retry exactly once"
+
+fail_dest="${regression_test}/failed-output.bin"
+if MOCK_CURL_MODE=fail MOCK_CURL_STATE="${regression_test}/fail-state" \
+    PATH="${regression_test}/download-https-bin:$PATH" \
+    bash -c 'RED=red; PLAIN=plain; source "$1"; download_https https://mock.example/asset "$2"' \
+    _ "$download_https_function" "$fail_dest" >/dev/null 2>&1; then
+    fail "download_https unexpectedly succeeded when all transfers fail"
+fi
+[[ ! -e "$fail_dest" ]] || fail "download_https left a partial file at the final destination"
+shopt -s nullglob
+leftover_parts=("${regression_test}/failed-output.bin.part."*)
+shopt -u nullglob
+(( ${#leftover_parts[@]} == 0 )) || fail "download_https left temporary partial files after failure"
+
 # Domestic-source mode builds the expected proxy prefix and persists for future shortcut runs.
 url_functions="${regression_test}/url-functions.sh"
 sed -n '/^raw_direct_base_url()/,/^}/p; /^raw_base_url()/,/^}/p' "$ROOT/install.sh" > "$url_functions"
@@ -253,7 +337,7 @@ bash -c '
 ' _ "$ROOT" || fail "low-port validation/capability regression"
 
 # 10. Hysteria should not use a decade-long certificate or hard-coded CN.
-[[ $(grep -Fc 'sni=$(get_best_sni)' "$ROOT/modules/protocol.sh") -ge 2 ]] || fail "Hysteria/TUIC SNI is not selected dynamically"
+[[ $(grep -Fc 'sni=$(get_best_sni "$sni_mode")' "$ROOT/modules/protocol.sh") -ge 3 ]] || fail "all protocols must use the shared SNI selector"
 grep -Fq -- '-days 365 -subj "/CN=${sni}"' "$ROOT/modules/protocol.sh" || fail "Hysteria certificate lifetime/subject incorrect"
 ! grep -Fq -- '-days 3650' "$ROOT/modules/protocol.sh" || fail "legacy long-lived self-signed certificate remains"
 
@@ -802,21 +886,21 @@ esac
 MOCK_CURL
 chmod 755 "$update_test/mockbin/curl" "$update_test/mockbin/sing-box"
 cp "$update_test/same/protocol_catalog.json" "$update_test/new/protocol_catalog.json"
-jq --arg version '1.0.18' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
+jq --arg version '1.0.20' '.tool_version = $version' "$update_test/new/protocol_catalog.json" > "$update_test/new/catalog.tmp"
 mv "$update_test/new/catalog.tmp" "$update_test/new/protocol_catalog.json"
-printf '1.0.18\n' > "$update_test/new/VERSION"
+printf '1.0.20\n' > "$update_test/new/VERSION"
 no_update_output=$(printf '0\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/same" \
     EASY_VPN_ROOT="$ROOT" EASY_VPN_ETC="$update_test/etc" EASY_VPN_STATE="$update_test/state" \
     EASY_VPN_BACKUPS="$update_test/backups" EASY_VPN_LOG="$update_test/log" \
     EASY_VPN_PROTOCOL_CATALOG_URL='https://mock.example/protocol_catalog.json' EASY_VPN_VERSION_URL='https://mock.example/VERSION' \
-    bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; protocol_update_check' _ "$ROOT" 2>&1) || fail "no-update menu flow failed"
+    bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; latest_singbox_version() { return 1; }; protocol_update_check' _ "$ROOT" 2>&1) || fail "no-update menu flow failed"
 grep -q '2. 重装当前最新版' <<< "$no_update_output" || fail "reinstall prompt absent when up to date"
 grep -q '未执行重装' <<< "$no_update_output" || fail "reinstall cancellation not respected"
 update_cancel_output=$(printf '1\nN\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/new" \
     EASY_VPN_ROOT="$ROOT" EASY_VPN_ETC="$update_test/etc" EASY_VPN_STATE="$update_test/state" \
     EASY_VPN_BACKUPS="$update_test/backups" EASY_VPN_LOG="$update_test/log" \
     EASY_VPN_PROTOCOL_CATALOG_URL='https://mock.example/protocol_catalog.json' EASY_VPN_VERSION_URL='https://mock.example/VERSION' \
-    bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; protocol_update_check' _ "$ROOT" 2>&1) || fail "update cancellation flow failed"
+    bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; latest_singbox_version() { return 1; }; protocol_update_check' _ "$ROOT" 2>&1) || fail "update cancellation flow failed"
 grep -q '1. 更新到最新版' <<< "$update_cancel_output" || fail "update prompt absent when update is available"
 grep -q '已取消更新' <<< "$update_cancel_output" || fail "update cancellation not respected"
 # Isolated resource summary smoke: avoid touching the host's /etc/easy-vpn.
@@ -944,20 +1028,35 @@ MOCK_RAW_CURL
     }
 fi
 
-# 11. SNI no longer auto-selects Google; custom Reality SNI values are validated.
+# 11. SNI candidate filtering and auto-ranking are deterministic without live network calls.
 EASY_VPN_ROOT="$regression_test/root" EASY_VPN_ETC="$regression_test/etc" \
 EASY_VPN_STATE="$regression_test/state" EASY_VPN_BACKUPS="$regression_test/backups" EASY_VPN_LOG="$regression_test/log" \
 bash -c '
   source "$1/lib/common.sh"; source "$1/modules/protocol.sh"
-  grep -q "local candidates=" "$1/modules/protocol.sh" || exit 101
+  grep -q "local mode=.*candidates=" "$1/modules/protocol.sh" || exit 101
   ! grep -Fq "dl.google.com" <(sed -n "/^get_best_sni()/,/^}/p" "$1/modules/protocol.sh") || exit 102
   validate_sni_hostname www.example.com || exit 103
   validate_sni_hostname api.apple.com || exit 104
   if validate_sni_hostname "-bad.example.com"; then exit 105; fi
   if validate_sni_hostname "bad..example.com"; then exit 106; fi
   if validate_sni_hostname "example.com:443"; then exit 107; fi
-  grep -q "Reality SNI .*自定义域名" "$1/modules/protocol.sh" || exit 108
-' _ "$ROOT" || fail "Reality SNI selection/validation regression"
+  if sni_candidate_domain_allowed example.com; then exit 108; fi
+  if sni_candidate_domain_allowed 127.0.0.1; then exit 109; fi
+  if sni_candidate_domain_allowed local.test; then exit 110; fi
+  sni_probe_domain() {
+    case "$1" in
+      www.apple.com) printf "%s\\t%s\\t%s\\n" "$1" 90 3 > "$2" ;;
+      addons.mozilla.org) printf "%s\\t%s\\t%s\\n" "$1" 70 3 > "$2" ;;
+      www.icloud.com) printf "%s\\t%s\\t%s\\n" "$1" 10 2 > "$2" ;;
+      *) return 1 ;;
+    esac
+  }
+  selected=$(get_best_sni --auto 2>"$EASY_VPN_ROOT/sni-test.log") || exit 111
+  [[ "$selected" == "addons.mozilla.org" ]] || exit 112
+  grep -Fq "Prefer stability first" "$1/modules/protocol.sh" || exit 113
+  ! grep -Fq "回车使用自动建议" "$1/modules/protocol.sh" || exit 114
+  grep -Fq "输入序号选择域名；输入 0 自动选择综合最佳项" "$1/modules/protocol.sh" || exit 115
+' _ "$ROOT" || fail "SNI filtering/selection regression"
 
 # 12. Protocol inbounds use an IPv4 wildcard when IPv6 is explicitly disabled.
 listen_test="$regression_test/listen-address"
@@ -1123,7 +1222,7 @@ fi
 echo "NEW_ENTRYPOINT_REACHED"
 STUB_INSTALL
 chmod 755 "$reload_test/root/install.sh"
-reload_output=$(printf '1\nY\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/new"     EASY_VPN_ROOT="$reload_test/root" EASY_VPN_ETC="$reload_test/etc" EASY_VPN_STATE="$reload_test/state"     EASY_VPN_BACKUPS="$reload_test/backups" EASY_VPN_LOG="$reload_test/log"     EASY_VPN_PROTOCOL_CATALOG_URL='https://mock.example/protocol_catalog.json' EASY_VPN_VERSION_URL='https://mock.example/VERSION'     bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; protocol_update_check' _ "$ROOT" 2>&1) || fail "successful update reload flow failed"
+reload_output=$(printf '1\nY\n' | PATH="$update_test/mockbin:$PATH" MOCK_REMOTE_DIR="$update_test/new"     EASY_VPN_ROOT="$reload_test/root" EASY_VPN_ETC="$reload_test/etc" EASY_VPN_STATE="$reload_test/state"     EASY_VPN_BACKUPS="$reload_test/backups" EASY_VPN_LOG="$reload_test/log"     EASY_VPN_PROTOCOL_CATALOG_URL='https://mock.example/protocol_catalog.json' EASY_VPN_VERSION_URL='https://mock.example/VERSION'     bash -c 'source "$1/lib/common.sh"; source "$1/modules/protocol.sh"; latest_singbox_version() { return 1; }; protocol_update_check' _ "$ROOT" 2>&1) || fail "successful update reload flow failed"
 grep -q 'NEW_ENTRYPOINT_REACHED' <<< "$reload_output" || fail "updated menu entrypoint was not executed"
 ! grep -q '请重新运行.*vpn' <<< "$reload_output" || fail "update still asks the user to manually reload"
 rm -rf -- "$update_test"
