@@ -116,7 +116,7 @@ Easy VPN 协议搭建工具
 适用于 VPS 可以直接访问 GitHub Raw 的情况：
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
+curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | bash
 ```
 
 ### 一键安装（国内网络加速）
@@ -126,7 +126,7 @@ curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" |
 > **安全提醒：** 这条命令会从第三方加速服务取得将以 root 权限执行的初始脚本。本 ZIP 没有配置发布签名公钥，所以此模式无法独立验证代理返回的脚本确实来自维护者。只有在你明确接受这项信任风险时才使用；安装器会保存该选择，供之后更新时沿用。
 
 ```bash
-curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china EASY_VPN_ALLOW_UNSIGNED_PROXY=1 bash
+curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | env EASY_VPN_GITHUB_SOURCE_MODE=china EASY_VPN_ALLOW_UNSIGNED_PROXY=1 bash
 ```
 
 仓库和分支已固定为本项目的 `yesok6/easy-vpn` 与 `main`，不需要填写用户名或仓库名。如果初始安装脚本本身无法从加速服务下载，可将链接里的 `https://gh-proxy.org/` 前缀去掉，改用 GitHub 官方 Raw 地址重新获取安装脚本。
