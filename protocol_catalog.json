@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "tool_version": "1.0.17",
-  "updated_at": "2026-10-14",
+  "tool_version": "1.0.19",
+  "updated_at": "2026-10-21",
   "protocols": [
     {
       "id": "vless-reality",
