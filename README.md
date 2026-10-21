@@ -1,8 +1,30 @@
 # Easy VPN
 
-**版本：1.0.19**
+**版本：1.0.22**
 
 Easy VPN 是独立的 VPS 协议搭建与节点管理项目。启动后直接进入协议菜单，不包含 SSH 管理、系统安全、网络优化或 IP 测试等通用运维模块。
+
+
+## 1.0.22 Root 安装说明一致性修复
+
+- 把以 root 用户安装的命令放在安装说明首位：`curl ... | bash`，不要求安装 `sudo`，也不要求创建普通登录用户。
+- 保留普通用户使用 `sudo bash` 的可选方式，并分别列出国内加速、手动下载、ZIP 安装和测试命令。
+- 安装器的权限错误提示会检测 `sudo` 是否存在；若不存在，会明确提示切换到 root 后使用 `bash install.sh`，不再只输出无法执行的 `sudo` 命令。
+- Easy VPN 服务仍会使用受限的系统服务账户运行（如安装逻辑需要创建该账户）；这与要求用户额外创建登录账户无关，也不建议让代理服务全程以 root 运行。
+
+## 1.0.21 全流程下载重试与续传补齐
+
+- 补齐安装器首次同步项目文件时的下载逻辑：单次最长 600 秒、连接超时 15 秒，并增加低速保护。
+- 安装器引导下载遇到中断时尝试从临时文件续传；下载源不支持 Range 时清理临时内容并改为完整下载，国内加速源失败仍会回退到官方 GitHub Raw。
+- 下载期间使用权限为 600 的临时文件，只在完整下载成功后替换目标文件，避免把不完整的脚本或配置当成已下载文件。
+- 延续 1.0.20 的 sing-box 下载续传和 SNI 扫描修复；未启用发布数字签名的限制仍然存在。
+
+## 1.0.20 SNI 延迟测量与扫描调度修复
+
+- 不再把 curl 的累计 `time_appconnect` 误当成 TLS 单独耗时；分别计算 DNS、TCP、TLS 的中位耗时。
+- 列表显示 DNS、TCP、TLS 及排除 DNS 后的 TCP+TLS 建连耗时；按稳定性优先、TCP+TLS 耗时次之排序。
+- 每批最多并发测试 2 个候选域名，减少低配 VPS 多站点同时握手造成的资源竞争，改善测量稳定性。
+- 延迟是 VPS 到候选网站的探测数据，不等于用户客户端连接 VPS 的代理延迟；如果 TCP+TLS 仍高，可能是 VPS 到目标网站的真实网络路径较远或不稳定。
 
 
 ## 1.0.19 Reality SNI 候选扫描与筛选
@@ -113,10 +135,16 @@ Easy VPN 协议搭建工具
 
 ### 一键安装（GitHub 官方源）
 
-适用于 VPS 可以直接访问 GitHub Raw 的情况：
+适用于 VPS 可以直接访问 GitHub Raw 的情况。**如果终端提示符是 `root@主机名:~#`，直接使用第一条命令，不需要 `sudo`，也不需要为安装额外创建普通登录用户：**
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | bash
+```
+
+如果你是普通用户，且系统已安装 `sudo`，则使用：
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo bash
 ```
 
 ### 一键安装（国内网络加速）
@@ -125,18 +153,27 @@ curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" |
 
 > **安全提醒：** 这条命令会从第三方加速服务取得将以 root 权限执行的初始脚本。本 ZIP 没有配置发布签名公钥，所以此模式无法独立验证代理返回的脚本确实来自维护者。只有在你明确接受这项信任风险时才使用；安装器会保存该选择，供之后更新时沿用。
 
+如果你已经是 root：
+
 ```bash
 curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | env EASY_VPN_GITHUB_SOURCE_MODE=china EASY_VPN_ALLOW_UNSIGNED_PROXY=1 bash
 ```
 
+普通用户（系统已安装 `sudo`）使用：
+
+```bash
+curl -fsSL "https://gh-proxy.org/https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" | sudo env EASY_VPN_GITHUB_SOURCE_MODE=china EASY_VPN_ALLOW_UNSIGNED_PROXY=1 bash
+```
+
 仓库和分支已固定为本项目的 `yesok6/easy-vpn` 与 `main`，不需要填写用户名或仓库名。如果初始安装脚本本身无法从加速服务下载，可将链接里的 `https://gh-proxy.org/` 前缀去掉，改用 GitHub 官方 Raw 地址重新获取安装脚本。
 
-**首次引导的信任问题：** 只有维护者配置了公钥、并发布匹配的签名文件时，安装器才会验证后续同步文件与更新；当前 ZIP 未配置公钥，所以当前版本尚未启用这层签名保护。第一次用 `curl | sudo bash` 取得的 `install.sh` 本身，无论如何都需要信任所选下载渠道。想要更稳妥，请先下载，再与项目发布说明中通过独立可信渠道公布的哈希比对后执行：
+**首次引导的信任问题：** 只有维护者配置了公钥、并发布匹配的签名文件时，安装器才会验证后续同步文件与更新；当前 ZIP 未配置公钥，所以当前版本尚未启用这层签名保护。第一次用 `curl | bash`（或普通用户使用的 `curl | sudo bash`）取得的 `install.sh` 本身，无论如何都需要信任所选下载渠道。想要更稳妥，请先下载，再与项目发布说明中通过独立可信渠道公布的哈希比对后执行：
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/yesok6/easy-vpn/main/install.sh" -o install.sh
 sha256sum install.sh        # 与项目发布页公布的 install.sh SHA-256 比对一致后再继续
-sudo bash install.sh
+bash install.sh             # 当前已是 root 时
+# sudo bash install.sh      # 普通用户且系统已安装 sudo 时，取消注释使用
 ```
 
 ### 可选的发布签名（进阶维护者功能）
@@ -148,11 +185,19 @@ sudo bash install.sh
 1. 在自己可信的维护电脑上运行 `bash tools/release.sh init-key`。私钥保存在 `~/.easy-vpn-release/release-private.pem`（权限 600）。**绝不要把私钥上传到 GitHub、放进 VPS 或发给任何人**，并做好离线备份。
 2. 每次发布前运行 `bash tools/release.sh release`。它会把公钥写进 `install.sh`，生成 `SHA256SUMS` 和 `SHA256SUMS.sig` 并自检。
 3. 将 `install.sh`、`lib/common.sh`、`modules/protocol.sh`、`protocol_catalog.json`、`VERSION`、`SHA256SUMS` 和 `SHA256SUMS.sig` 一起提交。以后修改任何受签名文件都必须重新签名。
-4. 首次 `curl | sudo bash` 仍要信任你获取初始脚本的下载渠道；签名机制主要保护安装器后续获取的项目文件与更新。
+4. 首次通过管道执行下载到的 `install.sh` 仍要信任所选下载渠道（root 使用 `curl | bash`，普通用户可使用 `curl | sudo bash`）；签名机制主要保护安装器后续获取的项目文件与更新。
 
 ### ZIP 安装（备用方式）
 
 从 GitHub 下载 ZIP 并解压，在项目目录执行：
+
+root 用户执行：
+
+```bash
+bash install.sh
+```
+
+普通用户（系统已安装 `sudo`）执行：
 
 ```bash
 sudo bash install.sh
@@ -238,7 +283,7 @@ tests_smoke.sh
 
 仍需你知道的限制：
 
-- 首次 `curl | sudo bash` 取得的 `install.sh` 无法被自身验证，请按上文先核对哈希。
+- 首次经管道执行取得的 `install.sh` 无法被自身验证，请按上文先核对哈希。
 - sing-box 的 SHA-256 来自与二进制相同的 GitHub 发布源，它能防下载损坏和传输篡改，但防不了上游发布本身被投毒。
 - 流水线模式 `--pipeline-reality` 会把 UUID、公钥和分享链接打印到标准输出；在 CI 或会保存日志的环境里使用时，请对输出做保密处理。
 - 私钥一旦泄露，攻击者即可签发恶意更新；请妥善保管并按需轮换。
